@@ -27,11 +27,9 @@ from typing import Any
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import metrics as M
-import probe as P
-import simulator as S
+from . import metrics as M
+from . import probe as P
+from . import simulator as S
 
 
 # --------------------------------------------------------------------------
@@ -44,7 +42,7 @@ def git_commit() -> str:
         return subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
-            cwd=Path(__file__).resolve().parent.parent,
+            cwd=Path(__file__).resolve().parents[2],
         ).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
@@ -242,23 +240,25 @@ def report_method(
 
 
 def run_real(args: argparse.Namespace) -> int:
-    """Скелет прогона на настоящей модели.
+    """Прогон на настоящей модели — пока до проверки окон и хука.
 
-    Намеренно останавливается на явных TODO, а не делает вид, что работает:
-    формат tool-call, парсер действия и границы окон зависят от конкретной
-    модели и должны быть проверены руками (см. steering.locate_windows).
+    Сделано: загрузка, аудит данных, разбиение, построение и печать окон на
+    реальном шаблоне, проверка, что хук срабатывает в окне на этой модели.
+    Не сделано (явный NotImplementedError ниже): парсер действия под формат
+    модели и цикл сбора активаций/probe/вектора.
     """
     try:
-        import torch  # noqa: F401
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError:
-        print("ERROR: нужны torch и transformers. pip install torch transformers")
+        print("ERROR: нужны torch и transformers: pip install -e '.[model]'")
         return 2
 
-    import steering as ST
+    from . import steering as ST
+    from .windows import describe_windows, prepare_prompt
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype="auto")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype="auto")
     model.eval()
     print(f"loaded {args.model}: {ST.n_layers(model)} layers")
 
@@ -268,19 +268,37 @@ def run_real(args: argparse.Namespace) -> int:
     if not rep.ok:
         print("audit failed -> исправить данные до прогона")
         return 1
-
     splits = S.split_tasks(tasks, seed=args.seed)
     print({k: len(v) for k, v in splits.items()})
 
+    # 1) окна на реальном шаблоне — глазами
+    t = next(x for x in splits["train"] if x.pair_type == "changing")
+    prepared = prepare_prompt(tok, t.prompt(1), essential_field=t.essential_field(1),
+                              tools=S.tools_schema())
+    print(describe_windows(tok, prepared))
+
+    # 2) хук срабатывает ровно в окне на этой модели
+    layer = ST.n_layers(model) // 2
+    hidden = model.config.get_text_config().hidden_size
+    probe_vec = ST.SteeringVector(layer, np.ones(hidden, dtype=np.float32), "post_message",
+                                  {"purpose": "hook smoke test"})
+    win = prepared.windows["post_message"]
+    with ST.steering(model, probe_vec, ST.SteerConfig(alpha=1.0, window=win)) as hook:
+        with torch.no_grad():
+            model(**prepared.model_inputs(model.device))
+    print(f"hook: n_applied={hook.n_applied} (window {len(win)}), "
+          f"positions from {hook.positions_source}")
+    if hook.n_applied != len(win):
+        print("ERROR: хук изменил не то число позиций — окна и вход разъехались")
+        return 1
+
     raise NotImplementedError(
-        "Перед реальным прогоном закрыть три пункта:\n"
-        "  1) формат tool message и tool-call под выбранный chat template;\n"
-        "  2) simulator.parse_action -> реальный парсер действий модели;\n"
-        "  3) проверить окна из steering.locate_windows ГЛАЗАМИ: напечатать\n"
-        "     токены по индексам окна и убедиться, что попали после ответа.\n"
-        "Затем: собрать активации (ActivationRecorder) -> probe.sweep_layers на\n"
-        "train -> contrastive_vector -> подбор alpha/слоя на VALIDATION ->\n"
-        "заморозить -> прогон с sham-контролями -> test один раз."
+        "Осталось до реального прогона:\n"
+        "  1) simulator.parse_action -> парсер под формат вызова этой модели\n"
+        "     (у Qwen3.x: <tool_call><function=NAME>...);\n"
+        "  2) цикл: ActivationRecorder на train -> probe.sweep_layers ->\n"
+        "     contrastive_vector -> подбор alpha/слоя на VALIDATION -> заморозка ->\n"
+        "     прогон с sham-контролями -> test один раз."
     )
 
 
@@ -384,7 +402,7 @@ def run_mock(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true", help="прогон без модели")
@@ -398,7 +416,7 @@ def main() -> int:
     ap.add_argument("--use-rate", type=float, default=0.35)
     ap.add_argument("--steer-gain", type=float, default=0.35)
     ap.add_argument("--steer-cost", type=float, default=0.10)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.mock:
         return run_mock(args)

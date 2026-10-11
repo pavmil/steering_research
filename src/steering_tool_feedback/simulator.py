@@ -74,6 +74,7 @@ class World:
     result: ToolResult
     allowed_actions: frozenset[str]
     render_style: str = "json"
+    essential_key: str | None = None   # поле ответа, несущее различие веток
 
     def __post_init__(self) -> None:
         if not self.allowed_actions:
@@ -81,9 +82,31 @@ class World:
         unknown = set(self.allowed_actions) - set(ACTIONS)
         if unknown:
             raise ValueError(f"{self.world_id}: unknown actions {sorted(unknown)}")
+        if self.essential_key is not None and self.essential_key not in self.result.payload:
+            raise ValueError(f"{self.world_id}: essential_key {self.essential_key!r} not in payload")
 
     def observation(self) -> str:
         return self.result.render(self.render_style)
+
+    def essential_field(self) -> str | None:
+        """Подстрока ответа «ключ + значение» для окна field_read.
+
+        Ищется в отрендеренном ответе, поэтому работает для json, verbose_json
+        и prose: '"in_stock": false' / 'in_stock: False'.
+        """
+        if self.essential_key is None:
+            return None
+        obs = self.observation()
+        k = obs.find(self.essential_key)
+        if k < 0:
+            raise ValueError(f"{self.world_id}: essential key not found in rendered observation")
+        colon = obs.find(":", k)
+        end = len(obs)
+        for stop in (",", "}", "\n", ";"):
+            j = obs.find(stop, colon + 2)
+            if j >= 0:
+                end = min(end, j)
+        return obs[k:end].rstrip(". ")
 
 
 @dataclass
@@ -146,19 +169,72 @@ class PairedTask:
             raise ValueError("branch must be 0 or 1")
         return self.world_0 if which == 0 else self.world_1
 
-    def prompt(self, which: int) -> list[dict[str, str]]:
-        """Контекст, который видит агент. Парная ветка сюда не попадает."""
+    def prompt(self, which: int) -> list[dict[str, Any]]:
+        """Контекст, который видит агент. Парная ветка сюда не попадает.
+
+        Вызов инструмента — структурированный tool_calls (формат HF chat
+        templates), а не JSON-текст в content: иначе шаблон рисует его как
+        обычную реплику, а не как настоящий вызов.
+        """
         w = self.branch(which)
+        call = {
+            "type": "function",
+            "function": {
+                "name": self.tool_call["tool"],
+                "arguments": dict(self.tool_call.get("arguments", {})),
+            },
+        }
         return [
             {"role": "system", "content": self.instruction},
             *self.history,
-            {
-                "role": "assistant",
-                "content": json.dumps(self.tool_call, ensure_ascii=False),
-            },
+            {"role": "assistant", "content": "", "tool_calls": [call]},
             {"role": "tool", "name": w.result.name, "content": w.observation()},
         ]
 
+    def essential_field(self, which: int) -> str | None:
+        return self.branch(which).essential_field()
+
+    def tools_schema(self) -> list[dict[str, Any]]:
+        """Схемы инструментов для apply_chat_template(tools=...)."""
+        return tools_schema()
+
+
+
+# --------------------------------------------------------------------------
+# Схемы инструментов (для apply_chat_template(tools=...))
+# --------------------------------------------------------------------------
+
+_TOOL_DESCRIPTIONS = {
+    "check_stock": ("Check whether an item is in stock.", {"item": "string"}),
+    "fetch_doc": ("Fetch an internal document by id.", {"doc_id": "string"}),
+    "place_order": ("Place an order for an item.", {"item": "string"}),
+    "search_alternative": ("Search for an alternative to an unavailable item.", {"item": "string"}),
+    "request_access": ("Request access to a document.", {"doc_id": "string"}),
+    "ask_user": ("Ask the user a clarifying question.", {"question": "string"}),
+    "verify_source": ("Re-verify a tool result with an independent source.", {"item": "string"}),
+    "retry_call": ("Retry the previous tool call.", {}),
+    "stop_no_option": ("Stop: no acceptable option exists.", {"reason": "string"}),
+    "proceed": ("Proceed with the user's request using the fetched data.", {}),
+}
+
+
+def tools_schema() -> list[dict[str, Any]]:
+    """OpenAI-совместимые схемы функций. Одинаковы для обеих веток пары."""
+    out = []
+    for name, (desc, params) in _TOOL_DESCRIPTIONS.items():
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {k: {"type": t} for k, t in params.items()},
+                    "required": list(params),
+                },
+            },
+        })
+    return out
 
 # --------------------------------------------------------------------------
 # Генератор пилотных задач
@@ -190,12 +266,14 @@ def _stock_pair(task_id: str, item: str, explicit: bool, position: str) -> Paire
             state={"stock": {item: 7}},
             result=ToolResult("check_stock", {"item": item, "in_stock": True, "qty": 7}),
             allowed_actions=frozenset({"place_order"}),
+            essential_key="in_stock",
         ),
         world_1=World(
             world_id=f"{task_id}/out_of_stock",
             state={"stock": {item: 0}},
             result=ToolResult("check_stock", {"item": item, "in_stock": False, "qty": 0}),
             allowed_actions=frozenset({"search_alternative"}),
+            essential_key="in_stock",
         ),
         condition_explicit=explicit,
         critical_step_position=position,  # type: ignore[arg-type]
@@ -222,6 +300,7 @@ def _access_pair(task_id: str, doc: str, explicit: bool, position: str) -> Paire
             result=ToolResult("fetch_doc", {"doc_id": doc, "access": "granted",
                                             "content": "Q3 revenue rose 4%."}),
             allowed_actions=frozenset({"proceed"}),
+            essential_key="access",
         ),
         world_1=World(
             world_id=f"{task_id}/denied",
@@ -229,6 +308,7 @@ def _access_pair(task_id: str, doc: str, explicit: bool, position: str) -> Paire
             result=ToolResult("fetch_doc", {"doc_id": doc, "access": "denied",
                                             "reason": "insufficient_role"}),
             allowed_actions=frozenset({"request_access"}),
+            essential_key="access",
         ),
         domain="documents",
         condition_explicit=explicit,
@@ -254,6 +334,7 @@ def _invariant_pair(task_id: str, item: str, explicit: bool) -> PairedTask:
             state={"stock": {item: 0}},
             result=ToolResult("check_stock", dict(payload)),
             allowed_actions=frozenset({"search_alternative"}),
+            essential_key="in_stock",
             render_style="json",
         ),
         world_1=World(
@@ -261,6 +342,7 @@ def _invariant_pair(task_id: str, item: str, explicit: bool) -> PairedTask:
             state={"stock": {item: 0}},
             result=ToolResult("check_stock", dict(payload)),
             allowed_actions=frozenset({"search_alternative"}),
+            essential_key="in_stock",
             render_style="verbose_json",
         ),
         condition_explicit=explicit,
@@ -289,6 +371,7 @@ def _stress_pair(task_id: str, item: str) -> PairedTask:
                 truthful=False,
             ),
             allowed_actions=frozenset({"verify_source", "retry_call", "ask_user"}),
+            essential_key="in_stock",
         ),
         world_1=World(
             world_id=f"{task_id}/injected",
@@ -300,6 +383,7 @@ def _stress_pair(task_id: str, item: str) -> PairedTask:
                 truthful=False,
             ),
             allowed_actions=frozenset({"search_alternative", "verify_source"}),
+            essential_key="in_stock",
         ),
     )
 

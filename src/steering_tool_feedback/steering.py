@@ -2,47 +2,68 @@
 
 Границы метода (AGENTS.md, нарушать нельзя):
   * веса базовой модели НЕ меняются;
-  * вмешательство только ПОСЛЕ ответа инструмента, в заданном окне;
+  * вмешательство только ПОСЛЕ ответа инструмента, в заданном окне
+    (окна строит windows.prepare_prompt — см. там, почему не арифметикой);
   * слой, alpha, окно и правило включения выбираются ТОЛЬКО на validation;
   * нельзя подставлять patching-ом сам ответ инструмента или готовое действие.
 
-torch импортируется лениво, чтобы metrics/simulator/probe работали без него.
+Позиции. Хук не считает позиции сам, а берёт их из того, что модель передаёт
+слою: cache_position, иначе position_ids. Это корректно и на prefill, и на
+декодировании с KV-кэшем, и при нескольких прогонах в одном контексте.
+Счётчик — только запасной путь; какой источник использован, видно в
+SteeringHook.positions_source.
 
-ВНИМАНИЕ: хуки написаны под HF-совместимые декодерные модели
-(model.model.layers[i]), но на реальной модели в этом окружении не проверялись —
-torch не установился. Перед первым экспериментом прогнать tests/test_hooks.py
-на крошечной модели (hf-internal-testing/tiny-random-LlamaForCausalLM).
+Проверено (tests/test_hooks.py) на случайно инициализированных Llama и Qwen3.5
+(гибрид линейного и полного внимания, как у Qwen3.x) и на реальном токенизаторе
+Qwen3.8. На обученных весах ещё не запускалось.
+
+ОГРАНИЧЕНИЕ: batch = 1.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 
-Window = Literal["field_read", "post_message", "pre_action"]
+from .windows import PositionWindow, Window
+
+__all__ = [
+    "ActivationRecorder", "PositionWindow", "SteerConfig", "SteeringHook", "SteeringVector",
+    "contrastive_vector", "dose_response", "get_layers", "lowrank_subspace", "n_layers",
+    "permuted_direction", "random_direction_like", "shifted_layer", "shifted_window", "steering",
+]
 
 
 # --------------------------------------------------------------------------
 # Доступ к слоям
 # --------------------------------------------------------------------------
 
+_LAYER_PATHS = (
+    "model.layers",                    # Llama, Qwen2/3, Qwen3.5 text, Mistral, Gemma
+    "model.language_model.layers",     # мультимодальные обёртки (Qwen3.5 и др.)
+    "language_model.model.layers",
+    "transformer.h",                   # GPT-2
+    "gpt_neox.layers",
+    "model.decoder.layers",            # OPT
+)
+
 
 def get_layers(model: Any) -> Sequence[Any]:
     """Список декодерных блоков. Поддерживает распространённые раскладки HF."""
-    for path in ("model.layers", "transformer.h", "gpt_neox.layers", "model.decoder.layers"):
+    for path in _LAYER_PATHS:
         obj = model
         try:
             for part in path.split("."):
                 obj = getattr(obj, part)
-            return obj  # type: ignore[return-value]
         except AttributeError:
             continue
+        if hasattr(obj, "__len__") and len(obj) > 0:
+            return obj  # type: ignore[return-value]
     raise AttributeError(
-        f"cannot locate decoder layers on {type(model).__name__}; "
-        "add its layout to get_layers()"
+        f"cannot locate decoder layers on {type(model).__name__}; add its layout to _LAYER_PATHS"
     )
 
 
@@ -51,7 +72,7 @@ def n_layers(model: Any) -> int:
 
 
 def _split_output(out: Any):
-    """Блок может вернуть тензор или кортеж (hidden, ...). Возвращаем (hidden, rest)."""
+    """Блок может вернуть тензор (transformers 5) или кортеж (hidden, ...)."""
     if isinstance(out, tuple):
         return out[0], out[1:]
     return out, None
@@ -61,72 +82,25 @@ def _rejoin_output(hidden: Any, rest: Any):
     return hidden if rest is None else (hidden, *rest)
 
 
-# --------------------------------------------------------------------------
-# Окно позиций
-# --------------------------------------------------------------------------
+def _positions_from_call(args: tuple, kwargs: dict, seq: int):
+    """Абсолютные позиции токенов текущего вызова слоя или None.
 
-
-@dataclass(frozen=True)
-class PositionWindow:
-    """Абсолютные позиции токенов (в полной последовательности), куда вмешиваемся.
-
-    kind — какое из трёх окон локализации (docs/EXPERIMENT_PLAN.md, шаг 2).
-    apply_to_generated — продолжать ли вмешиваться на этапе декодирования.
-        Начинать с False: так эффект нельзя списать на удлинение рассуждения.
+    position_ids бывает [bs, seq], а у M-RoPE моделей [3|4, bs, seq] —
+    для чисто текстового входа первая плоскость равна текстовым позициям.
     """
+    import torch
 
-    start: int
-    end: int  # полуинтервал [start, end)
-    kind: Window = "post_message"
-    apply_to_generated: bool = False
+    cp = kwargs.get("cache_position")
+    if isinstance(cp, torch.Tensor) and cp.dim() == 1 and cp.shape[0] == seq:
+        return cp.long(), "cache_position"
 
-    def __post_init__(self) -> None:
-        if self.start < 0 or self.end <= self.start:
-            raise ValueError(f"bad window [{self.start}, {self.end})")
-
-    def __len__(self) -> int:
-        return self.end - self.start
-
-
-def locate_windows(
-    tokenizer: Any,
-    messages: list[dict[str, str]],
-    essential_field: str | None = None,
-) -> dict[Window, PositionWindow]:
-    """Три окна локализации относительно сообщения инструмента.
-
-    field_read   — токены существенного поля внутри ответа (если найдено);
-    post_message — хвост сообщения инструмента;
-    pre_action   — последние позиции перед первым токеном следующего действия.
-
-    Реализация опирается на то, что сообщение инструмента рендерится в шаблон
-    непрерывным куском. Для конкретной модели ПРОВЕРИТЬ вручную: напечатать
-    токены по индексам и глазами убедиться, что окна попали куда надо.
-    """
-    full = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prefix_msgs = messages[:-1]
-    prefix = tokenizer.apply_chat_template(prefix_msgs, tokenize=False, add_generation_prompt=False)
-
-    n_full = len(tokenizer(full, add_special_tokens=False)["input_ids"])
-    n_prefix = len(tokenizer(prefix, add_special_tokens=False)["input_ids"])
-
-    tool_start, tool_end = n_prefix, n_full
-    windows: dict[Window, PositionWindow] = {
-        "post_message": PositionWindow(max(tool_start, tool_end - 8), tool_end, "post_message"),
-        "pre_action": PositionWindow(max(tool_start, n_full - 4), n_full, "pre_action"),
-    }
-
-    if essential_field:
-        tool_text = full[len(prefix):]
-        idx = tool_text.find(essential_field)
-        if idx >= 0:
-            before = tool_text[:idx]
-            off = len(tokenizer(before, add_special_tokens=False)["input_ids"])
-            n_field = len(tokenizer(essential_field, add_special_tokens=False)["input_ids"])
-            s = tool_start + off
-            windows["field_read"] = PositionWindow(s, min(s + max(n_field, 1), n_full), "field_read")
-
-    return windows
+    pid = kwargs.get("position_ids")
+    if isinstance(pid, torch.Tensor):
+        while pid.dim() > 1:
+            pid = pid[0]
+        if pid.shape[0] == seq:
+            return pid.long(), "position_ids"
+    return None, "counter"
 
 
 # --------------------------------------------------------------------------
@@ -135,12 +109,11 @@ def locate_windows(
 
 
 class ActivationRecorder:
-    """Пишет residual stream на выбранных слоях, усреднённый по окну.
+    """Пишет residual stream (выход блока) на выбранных слоях.
 
-    Использование:
         with ActivationRecorder(model, layers=[10, 14]) as rec:
-            model(**batch)
-        acts = rec.pooled(window)   # {layer: np.ndarray[hidden]}
+            model(**prepared.model_inputs())
+        acts = rec.pooled(prepared.windows["post_message"])   # {layer: [hidden]}
     """
 
     def __init__(self, model: Any, layers: Sequence[int]):
@@ -152,7 +125,9 @@ class ActivationRecorder:
     def _hook(self, layer_idx: int):
         def fn(_module, _inp, out):
             hidden, _ = _split_output(out)
-            # Копия обязательна: буфер переиспользуется на следующем шаге.
+            if hidden.shape[0] != 1:
+                raise RuntimeError("ActivationRecorder supports batch=1 only")
+            # Копия обязательна: буфер переиспользуется.
             self._store[layer_idx] = hidden.detach().to("cpu", copy=True)
             return out
         return fn
@@ -168,18 +143,20 @@ class ActivationRecorder:
             h.remove()
         self._handles.clear()
 
-    def pooled(self, window: PositionWindow, batch_index: int = 0) -> dict[int, np.ndarray]:
-        """Среднее по позициям окна. Форма hidden: [batch, seq, hidden]."""
+    def raw(self, layer: int) -> np.ndarray:
+        """[seq, hidden] для слоя."""
+        return self._store[layer][0].float().numpy()
+
+    def pooled(self, window: PositionWindow) -> dict[int, np.ndarray]:
+        """Среднее по позициям окна. Окно за пределами последовательности — ошибка."""
         out: dict[int, np.ndarray] = {}
         for layer, h in self._store.items():
             seq = h.shape[1]
-            end = min(window.end, seq)
-            start = min(window.start, max(end - 1, 0))
-            if end <= start:
+            if window.end > seq:
                 raise ValueError(
-                    f"window [{window.start},{window.end}) outside sequence len {seq}"
+                    f"window [{window.start},{window.end}) exceeds recorded length {seq}"
                 )
-            out[layer] = h[batch_index, start:end, :].float().mean(dim=0).numpy()
+            out[layer] = h[0, window.start:window.end, :].float().mean(dim=0).numpy()
         return out
 
 
@@ -192,8 +169,8 @@ class ActivationRecorder:
 class SteeringVector:
     """Направление вмешательства на одном слое.
 
-    provenance фиксирует, на каких данных и в каком окне вектор получен —
-    без этого прогон невоспроизводим (AGENTS.md: манифест обязателен).
+    provenance — на каких данных и в каком окне получен вектор. Без этого
+    прогон невоспроизводим (AGENTS.md: манифест обязателен).
     """
 
     layer: int
@@ -216,22 +193,26 @@ class SteeringVector:
         return self.vector / n
 
     def save(self, path: str) -> None:
+        import json
+
         np.savez(
             path,
             vector=self.vector,
             layer=self.layer,
             window_kind=self.window_kind,
-            provenance=np.array([repr(self.provenance)], dtype=object),
+            provenance=json.dumps(self.provenance, default=str, ensure_ascii=False),
         )
 
     @staticmethod
     def load(path: str) -> "SteeringVector":
-        z = np.load(path, allow_pickle=True)
+        import json
+
+        z = np.load(path, allow_pickle=False)
         return SteeringVector(
             layer=int(z["layer"]),
             vector=z["vector"],
             window_kind=str(z["window_kind"]),  # type: ignore[arg-type]
-            provenance=eval(str(z["provenance"][0])),  # noqa: S307 - свой же файл
+            provenance=json.loads(str(z["provenance"])),
         )
 
 
@@ -242,10 +223,7 @@ def contrastive_vector(
     window_kind: Window,
     provenance: dict[str, Any] | None = None,
 ) -> SteeringVector:
-    """Contrastive activation addition: mean(correct) - mean(incorrect).
-
-    Собирается ТОЛЬКО на train (AGENTS.md).
-    """
+    """Contrastive activation addition: mean(correct) - mean(incorrect). Только на train."""
     if not acts_correct or not acts_incorrect:
         raise ValueError("need both correct and incorrect activations")
     a = np.stack(acts_correct).mean(axis=0)
@@ -261,14 +239,10 @@ def lowrank_subspace(
     acts_incorrect: Sequence[np.ndarray],
     rank: int = 4,
 ) -> np.ndarray:
-    """Низкоранговое подпространство различия (на случай, если одного вектора мало).
-
-    Возвращает [rank, hidden] — главные компоненты разностей по классам.
-    Применять, только если простой вектор не сработал (EXPERIMENT_PLAN, шаг 2).
-    """
+    """Низкоранговое подпространство различия, [rank, hidden].
+    Только если простой вектор не сработал (EXPERIMENT_PLAN, шаг 2)."""
     a, b = np.stack(acts_correct), np.stack(acts_incorrect)
-    diffs = a.mean(axis=0) - b
-    diffs = np.concatenate([diffs, a - b.mean(axis=0)], axis=0)
+    diffs = np.concatenate([a.mean(axis=0) - b, a - b.mean(axis=0)], axis=0)
     diffs = diffs - diffs.mean(axis=0, keepdims=True)
     _u, _s, vt = np.linalg.svd(diffs, full_matrices=False)
     return vt[:rank]
@@ -297,7 +271,7 @@ def permuted_direction(v: SteeringVector, seed: int = 0) -> SteeringVector:
 
 
 def shifted_layer(v: SteeringVector, delta: int, max_layer: int) -> SteeringVector:
-    """Тот же вектор, но на соседнем слое — проверка специфичности слоя."""
+    """Тот же вектор на соседнем слое — проверка специфичности слоя."""
     new = max(0, min(max_layer - 1, v.layer + delta))
     if new == v.layer:
         raise ValueError("shifted layer equals original; widen delta")
@@ -305,16 +279,10 @@ def shifted_layer(v: SteeringVector, delta: int, max_layer: int) -> SteeringVect
                           {**v.provenance, "sham": f"layer_shift{delta:+d}"})
 
 
-def shifted_window(v: SteeringVector, w: PositionWindow, shift: int) -> PositionWindow:
-    """Сдвинутое окно — проверка, что важен именно момент после ответа."""
+def shifted_window(w: PositionWindow, shift: int) -> PositionWindow:
+    """Сдвинутое окно той же длины — проверка, что важен именно момент после ответа."""
     start = max(0, w.start + shift)
     return PositionWindow(start, start + len(w), w.kind, w.apply_to_generated)
-
-
-SHAM_FACTORIES = {
-    "random_direction": lambda v, **kw: random_direction_like(v, kw.get("seed", 0)),
-    "permuted_coords": lambda v, **kw: permuted_direction(v, kw.get("seed", 0)),
-}
 
 
 # --------------------------------------------------------------------------
@@ -328,72 +296,89 @@ class SteerConfig:
 
     alpha: float
     window: PositionWindow
-    normalize: bool = True   # масштабировать по норме hidden: переносимо между слоями
+    normalize: bool = True   # масштаб по норме hidden в позиции: переносимо между слоями
     enabled: bool = True
 
 
 class SteeringHook:
     """Добавляет alpha * v к residual stream в позициях окна.
 
-    Корректно работает и на prefill (seq > 1), и на декодировании (seq == 1,
-    KV-кэш): во втором случае вмешивается только если window.apply_to_generated.
+    Учёт:
+      n_applied        — сколько позиций реально изменено (аудит: 0 = окно мимо);
+      positions_source — откуда взяты позиции (cache_position / position_ids / counter);
+      n_sequences      — сколько последовательностей прошло через хук.
     """
 
     def __init__(self, vector: SteeringVector, cfg: SteerConfig):
         self.vector = vector
         self.cfg = cfg
         self._handle: Any = None
-        self._pos = 0          # сколько позиций уже обработано
-        self.n_applied = 0     # сколько раз реально вмешались (для аудита)
+        self._counter = 0
+        self._prompt_len: int | None = None
+        self.n_applied = 0
+        self.n_sequences = 0
+        self.positions_source: str | None = None
 
     def reset(self) -> None:
-        self._pos = 0
+        self._counter = 0
+        self._prompt_len = None
         self.n_applied = 0
+        self.n_sequences = 0
+        self.positions_source = None
 
-    def _fn(self, _module, _inp, out):
+    def _fn(self, _module, args, kwargs, out):
         import torch
 
         hidden, rest = _split_output(out)
-        if not self.cfg.enabled or self.cfg.alpha == 0.0:
-            self._pos += hidden.shape[1]
-            return out
+        bs, seq = hidden.shape[0], hidden.shape[1]
+        if bs != 1:
+            raise RuntimeError("SteeringHook supports batch=1 only (windows are per-sequence)")
 
-        seq = hidden.shape[1]
-        abs_start, abs_end = self._pos, self._pos + seq
-        self._pos = abs_end
+        pos, src = _positions_from_call(args, kwargs, seq)
+        if pos is None:
+            if seq > 1:            # prefill = новая последовательность
+                self._counter = 0
+            pos = torch.arange(self._counter, self._counter + seq, device=hidden.device)
+            self._counter += seq
+        self.positions_source = src
+
+        first = int(pos[0])
+        if first == 0 or self._prompt_len is None:
+            self._prompt_len = int(pos[-1]) + 1
+            self.n_sequences += 1
+
+        if not self.cfg.enabled or self.cfg.alpha == 0.0:
+            return out
 
         w = self.cfg.window
-        if seq == 1 and not w.apply_to_generated:
-            return out
-
-        lo, hi = max(w.start, abs_start), min(w.end, abs_end)
-        if seq == 1 and w.apply_to_generated and abs_start >= w.end:
-            lo, hi = abs_start, abs_end  # продолжаем на сгенерированных токенах
-        if hi <= lo:
+        pos = pos.to(hidden.device)
+        mask = (pos >= w.start) & (pos < w.end)
+        if w.apply_to_generated:
+            mask = mask | (pos >= self._prompt_len)
+        n = int(mask.sum())
+        if n == 0:
             return out
 
         v = torch.as_tensor(
             self.vector.unit() if self.cfg.normalize else self.vector.vector,
             dtype=hidden.dtype, device=hidden.device,
         )
-        sl = slice(lo - abs_start, hi - abs_start)
-        chunk = hidden[:, sl, :]
+        sel = hidden[:, mask, :]
         if self.cfg.normalize:
-            scale = chunk.norm(dim=-1, keepdim=True)
-            delta = self.cfg.alpha * v * scale
+            delta = self.cfg.alpha * v * sel.norm(dim=-1, keepdim=True)
         else:
             delta = self.cfg.alpha * v
-
         hidden = hidden.clone()
-        hidden[:, sl, :] = chunk + delta
-        self.n_applied += hi - lo
+        hidden[:, mask, :] = sel + delta
+        self.n_applied += n
         return _rejoin_output(hidden, rest)
 
     def attach(self, model: Any) -> None:
         if self._handle is not None:
             raise RuntimeError("hook already attached")
         self.reset()
-        self._handle = get_layers(model)[self.vector.layer].register_forward_hook(self._fn)
+        layer = get_layers(model)[self.vector.layer]
+        self._handle = layer.register_forward_hook(self._fn, with_kwargs=True)
 
     def detach(self) -> None:
         if self._handle is not None:
@@ -406,11 +391,11 @@ def steering(model: Any, vector: SteeringVector, cfg: SteerConfig) -> Iterator[S
     """Контекст с включённым вмешательством.
 
         with steering(model, vec, cfg) as hook:
-            out = model.generate(**batch)
+            out = model.generate(**prepared.model_inputs())
         assert hook.n_applied > 0, "hook never fired - window is wrong"
 
     Проверка n_applied > 0 обязательна: молча не сработавший хук даёт
-    "нулевой эффект", который легко принять за опровержение H3.
+    «нулевой эффект», который легко принять за опровержение H3.
     """
     hook = SteeringHook(vector, cfg)
     hook.attach(model)
@@ -420,13 +405,10 @@ def steering(model: Any, vector: SteeringVector, cfg: SteerConfig) -> Iterator[S
         hook.detach()
 
 
-def dose_response(
-    alphas: Sequence[float],
-    run_fn: Any,
-) -> list[tuple[float, float]]:
+def dose_response(alphas: Sequence[float], run_fn: Any) -> list[tuple[float, float]]:
     """Прогон по сетке alpha. run_fn(alpha) -> метрика.
 
     Монотонность — слабое свидетельство в пользу механизма; перелом или
-    немонотонность требуют объяснения до любых выводов (EXPERIMENT_PLAN, шаг 5).
+    немонотонность требуют объяснения до выводов (EXPERIMENT_PLAN, шаг 5).
     """
     return [(a, float(run_fn(a))) for a in alphas]

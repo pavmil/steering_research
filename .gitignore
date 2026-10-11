@@ -25,3 +25,7 @@ venv/
 # Среда
 .env
 .DS_Store
+
+# Сборка пакета
+build/
+dist/

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steering-tool-feedback"
+version = "0.1.0"
+description = "Causal steering of tool-feedback integration in LLM agents"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+# Реальные модели, хуки, окна на настоящем chat template.
+model = [
+    "torch>=2.2",
+    "transformers>=4.46",
+    "accelerate>=0.30",
+]
+# LoRA/SFT baseline — понадобится на этапе сравнения методов.
+finetune = [
+    "peft>=0.10",
+    "trl>=0.9",
+]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+stf-run = "steering_tool_feedback.run_experiment:main"
+stf-windows = "steering_tool_feedback.inspect_windows:main"
+stf-doctor = "steering_tool_feedback.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "model: needs torch + transformers (skipped if missing)",
+    "real_tokenizer: needs STF_TOKENIZER pointing to a local tokenizer dir",
+]

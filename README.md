@@ -27,19 +27,69 @@
 ## Структура
 
 ```
-docs/      — зафиксированные гипотезы, метрики, план, литература
-src/       — код: симулятор, сбор активаций, steering, evaluator
-data/      — парные задачи и миры (сырые данные не коммитить)
-results/   — прогоны, таблицы, графики
-skills/    — внешние скиллы (см. AGENTS.md про доверие)
+docs/                          зафиксированные гипотезы, метрики, план, литература
+src/steering_tool_feedback/    код (устанавливаемый пакет)
+  metrics.py                   pass^k, чувствительность/специфичность, bootstrap, цена
+  simulator.py                 парные миры, валидация протокола, схемы инструментов
+  windows.py                   окна позиций по offsets + печать токенов
+  steering.py                  съём активаций, вектор, хуки, sham-контроли
+  probe.py                     проверка H1 + контроли
+  run_experiment.py            прогон H1 → H2 → H3 (stf-run)
+  inspect_windows.py           проверка окон глазами (stf-windows)
+  doctor.py                    какой python и какие зависимости видны (stf-doctor)
+tests/                         pytest
+data/      парные задачи и миры (сырые данные не коммитить)
+results/   прогоны, таблицы, графики
+skills/    внешние скиллы (см. AGENTS.md про доверие)
 ```
+
+## Установка
+
+Ставить **в тот Python, которым будешь запускать** — глобальный или venv, неважно,
+главное один и тот же. Из корня репозитория:
+
+```bash
+python3 -m pip install -e ".[model,dev]"   # всё: модели + тесты
+python3 -m pip install -e .                # только ядро (metrics, simulator, probe)
+stf-doctor                                 # какой python запущен и что он видит
+```
+
+`-e` — editable: правки в `src/` подхватываются без переустановки, импорт работает
+из любой папки (`from steering_tool_feedback import metrics`), без `sys.path`.
+
+Если `stf-*` «command not found» — скрипты встали в папку не из PATH (типично для
+`pip install --user`: `~/Library/Python/3.x/bin` на macOS, `~/.local/bin` на Linux).
+`stf-doctor` покажет, куда именно и что дописать в `~/.zshrc`. Без PATH работает всегда:
+
+```bash
+python3 -m steering_tool_feedback doctor
+python3 -m steering_tool_feedback windows --tokenizer <...>
+python3 -m steering_tool_feedback run --mock
+```
+
+## Запуск
+
+```bash
+pytest                                          # все тесты; без модели и сети
+STF_TOKENIZER=<папка токенизатора> pytest       # + тесты на реальном chat template
+stf-windows --tokenizer <папка или HF id>       # окна позиций глазами — ДО экспериментов
+stf-windows --tokenizer <...> --all             # проверить окна на всём пилоте
+stf-run --mock                                  # обвязка и метрики без модели
+stf-run --model <HF id или папка>               # реальный режим (пока до проверки хука)
+```
+
+Токенизатор локальной модели LM Studio подходит для `stf-windows` и тестов:
+`~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit`. Сами веса в формате
+MLX 4-bit transformers не загружает — для экспериментов нужна модель в HF-формате.
 
 ## Что сделать первым
 
 1. Дочитать [2610.07722](https://arxiv.org/abs/2610.07722) — оценочный набор для steering,
    не удалось открыть при первом заходе.
-2. Выбрать модель 3–8B и зафиксировать окружение (checkpoint, chat template, decoding, seed).
-3. Собрать ядро матрицы: методы × тип пары, 100–200 парных задач, одна модель, один домен.
+2. Выбрать модель 3–8B в HF-формате, прогнать на ней `stf-windows` и `stf-run --model`
+   (последний проверяет, что хук срабатывает ровно в окне на этой модели).
+3. Написать парсер действия под формат вызова модели (см. AGENTS.md, «Код»).
+4. Собрать ядро матрицы: методы × тип пары, 100–200 парных задач, одна модель, один домен.
 
 ## Команда
 

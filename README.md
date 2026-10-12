@@ -4,7 +4,8 @@
 менять план по смыслу полученного результата инструмента — и выгоднее ли это, чем
 промпт, явное ведение состояния и дообучение.
 
-**Статус:** постановка зафиксирована, эксперименты не начаты.
+**Статус:** постановка зафиксирована, инфраструктура экспериментов готова,
+прогонов на обученной модели ещё не было. История — в [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## Ядро проекта в одном абзаце
 
@@ -13,34 +14,51 @@
 меняем **только** правдивый ответ — правильные следующие действия в двух ветках разные.
 Смотрим, меняет ли агент действие как надо, и помогает ли steering.
 
+## Быстрый старт (Mac)
+
+```bash
+python3 -m pip install -e ".[model,notebooks,dev]"
+stf-doctor                      # видит ли этот python torch/transformers и MPS
+pytest                          # ~1–2 мин, без модели и сети
+jupyter lab notebooks/
+```
+
+Дальше по порядку: `01_smoke_mock` → `02_model_check` → `03_h1_h2_baseline` → `04_h3_steering`.
+Новый эксперимент = копия `00_TEMPLATE.ipynb` с другой ячейкой конфига. В конце
+ноутбука вывод пишется в журнал. Как всё устроено — [docs/PIPELINE.md](docs/PIPELINE.md).
+
 ## Навигация
 
 | Файл | Что внутри |
 |---|---|
-| [CONTEXT.md](CONTEXT.md) | Контекст проекта, история решений, что отвергли и почему |
-| [AGENTS.md](AGENTS.md) | Правила работы в репозитории для AI-агентов |
+| [docs/JOURNAL.md](docs/JOURNAL.md) | **Журнал**: вся история — прогоны, решения, заметки |
+| [docs/PIPELINE.md](docs/PIPELINE.md) | Как устроен пайплайн экспериментов, гарантии протокола, расширение |
 | [docs/HYPOTHESES.md](docs/HYPOTHESES.md) | Зафиксированные гипотезы H1–H4 и критерии опровержения |
 | [docs/METRICS.md](docs/METRICS.md) | Зафиксированные метрики с источниками |
 | [docs/EXPERIMENT_PLAN.md](docs/EXPERIMENT_PLAN.md) | Матрица методы × контексты, поэтапный план |
 | [docs/RELATED_WORK.md](docs/RELATED_WORK.md) | Литература, проверка свободы ниши |
+| [CONTEXT.md](CONTEXT.md) | Контекст проекта, что отвергли и почему |
+| [AGENTS.md](AGENTS.md) | Правила работы в репозитории для AI-агентов |
 
 ## Структура
 
 ```
-docs/                          зафиксированные гипотезы, метрики, план, литература
+notebooks/                     эксперименты: 00_TEMPLATE + 01–04
+configs/                       YAML-конфиги для запуска без ноутбука (stf-run --config)
+docs/                          гипотезы, метрики, план, литература, PIPELINE, JOURNAL
 src/steering_tool_feedback/    код (устанавливаемый пакет)
-  metrics.py                   pass^k, чувствительность/специфичность, bootstrap, цена
-  simulator.py                 парные миры, валидация протокола, схемы инструментов
-  windows.py                   окна позиций по offsets + печать токенов
-  steering.py                  съём активаций, вектор, хуки, sham-контроли
-  probe.py                     проверка H1 + контроли
-  run_experiment.py            прогон H1 → H2 → H3 (stf-run)
-  inspect_windows.py           проверка окон глазами (stf-windows)
-  doctor.py                    какой python и какие зависимости видны (stf-doctor)
-tests/                         pytest
-data/      парные задачи и миры (сырые данные не коммитить)
-results/   прогоны, таблицы, графики
-skills/    внешние скиллы (см. AGENTS.md про доверие)
+  config.py                    конфиг эксперимента
+  pipeline.py                  стадии data → … → test, протокол, сводки
+  backends/                    HF (CPU / MPS / CUDA) и mock
+  methods.py                   baseline, strong_prompt, restate, steering, sham-контроли
+  gates.py  journal.py         вердикты H1–H4; журнал
+  simulator.py  windows.py     парные миры; окна позиций
+  steering.py  probe.py        хуки и векторы; probe
+  metrics.py  actions.py       метрики; формат вызова и разбор действия
+  store.py  viz.py             файлы и кэш; графики
+tests/                         pytest (в т.ч. исполнение ноутбуков)
+results/                       локально; в git — только index, test_lock, frozen, protocol
+skills/                        внешние скиллы (см. AGENTS.md про доверие)
 ```
 
 ## Установка
@@ -49,13 +67,15 @@ skills/    внешние скиллы (см. AGENTS.md про доверие)
 главное один и тот же. Из корня репозитория:
 
 ```bash
-python3 -m pip install -e ".[model,dev]"   # всё: модели + тесты
-python3 -m pip install -e .                # только ядро (metrics, simulator, probe)
-stf-doctor                                 # какой python запущен и что он видит
+python3 -m pip install -e ".[model,notebooks,dev]"   # всё
+python3 -m pip install -e .                          # только ядро (mock, метрики, симулятор)
+stf-doctor                                           # какой python запущен и что он видит
 ```
 
 `-e` — editable: правки в `src/` подхватываются без переустановки, импорт работает
 из любой папки (`from steering_tool_feedback import metrics`), без `sys.path`.
+Чтобы Jupyter видел пакет, ядро ноутбука должно быть тем же Python — `stf-doctor`
+в первой ячейке `02_model_check` это покажет.
 
 Если `stf-*` «command not found» — скрипты встали в папку не из PATH (типично для
 `pip install --user`: `~/Library/Python/3.x/bin` на macOS, `~/.local/bin` на Linux).
@@ -65,31 +85,22 @@ stf-doctor                                 # какой python запущен и
 python3 -m steering_tool_feedback doctor
 python3 -m steering_tool_feedback windows --tokenizer <...>
 python3 -m steering_tool_feedback run --mock
+python3 -m steering_tool_feedback note "текст"
 ```
 
-## Запуск
+## Команды
 
 ```bash
-pytest                                          # все тесты; без модели и сети
+pytest                                          # все тесты, включая исполнение ноутбуков на mock
 STF_TOKENIZER=<папка токенизатора> pytest       # + тесты на реальном chat template
-stf-windows --tokenizer <папка или HF id>       # окна позиций глазами — ДО экспериментов
-stf-windows --tokenizer <...> --all             # проверить окна на всём пилоте
-stf-run --mock                                  # обвязка и метрики без модели
-stf-run --model <HF id или папка>               # реальный режим (пока до проверки хука)
+stf-windows --tokenizer <папка или HF id>       # окна позиций глазами
+stf-run --mock                                  # весь пайплайн на mock
+stf-run --config configs/qwen3-1.7b-mac.yaml --until probe
+stf-note "решили сократить alpha до 3 значений" --tag решение
 ```
 
-Токенизатор локальной модели LM Studio подходит для `stf-windows` и тестов:
-`~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit`. Сами веса в формате
-MLX 4-bit transformers не загружает — для экспериментов нужна модель в HF-формате.
-
-## Что сделать первым
-
-1. Дочитать [2610.07722](https://arxiv.org/abs/2610.07722) — оценочный набор для steering,
-   не удалось открыть при первом заходе.
-2. Выбрать модель 3–8B в HF-формате, прогнать на ней `stf-windows` и `stf-run --model`
-   (последний проверяет, что хук срабатывает ровно в окне на этой модели).
-3. Написать парсер действия под формат вызова модели (см. AGENTS.md, «Код»).
-4. Собрать ядро матрицы: методы × тип пары, 100–200 парных задач, одна модель, один домен.
+Черновые прогоны, которые не должны попадать в журнал и `results/`:
+`STF_RESULTS_DIR=/tmp/r STF_JOURNAL=/tmp/j.md stf-run --mock`.
 
 ## Команда
 

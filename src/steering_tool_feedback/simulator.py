@@ -253,18 +253,45 @@ _BASE_INSTRUCTION_IMPLICIT = (
 )
 
 
-def _stock_pair(task_id: str, item: str, explicit: bool, position: str) -> PairedTask:
+_ITEMS = [
+    "blue mug", "desk lamp", "usb-c cable", "wool scarf", "kettle", "notebook",
+    "monitor stand", "coffee filter", "phone case", "yoga mat", "water bottle",
+    "hdmi adapter", "rain jacket", "bike lock", "cutting board", "desk chair",
+    "laptop sleeve", "travel pillow", "led bulb", "power bank", "paper towels",
+    "tea infuser", "wireless mouse", "frying pan", "backpack", "wall clock",
+    "plant pot", "shower curtain", "ice tray", "flashlight", "door mat", "tape measure",
+]
+_REQUESTS = [
+    "Please order a {item}.",
+    "Can you buy me a {item}?",
+    "I need a {item} - order one, please.",
+    "Add a {item} to my order.",
+    "Order one {item} for me, thanks.",
+]
+_DOC_REQUESTS = [
+    "Summarise the document {doc}.",
+    "What does {doc} say? Give me a short summary.",
+    "Please read {doc} and summarise it.",
+]
+_DOC_CONTENT = [
+    "Q3 revenue rose 4%.", "The migration finishes on Friday.", "Hiring is paused until May.",
+    "Two incidents were closed this week.", "The budget was approved with minor cuts.",
+]
+
+
+def _stock_pair(task_id: str, item: str, explicit: bool, position: str,
+                request: str | None = None, qty: int = 7) -> PairedTask:
     """changing: наличие/отсутствие товара -> разные допустимые действия."""
     return PairedTask(
         task_id=task_id,
         pair_type="changing",
         instruction=_BASE_INSTRUCTION_EXPLICIT if explicit else _BASE_INSTRUCTION_IMPLICIT,
-        history=[{"role": "user", "content": f"Please order a {item}."}],
+        history=[{"role": "user", "content": (request or "Please order a {item}.").format(item=item)}],
         tool_call={"tool": "check_stock", "arguments": {"item": item}},
         world_0=World(
             world_id=f"{task_id}/in_stock",
-            state={"stock": {item: 7}},
-            result=ToolResult("check_stock", {"item": item, "in_stock": True, "qty": 7}),
+            state={"stock": {item: qty}},
+            result=ToolResult("check_stock", {"item": item, "in_stock": True, "qty": qty}),
             allowed_actions=frozenset({"place_order"}),
             essential_key="in_stock",
         ),
@@ -280,7 +307,8 @@ def _stock_pair(task_id: str, item: str, explicit: bool, position: str) -> Paire
     )
 
 
-def _access_pair(task_id: str, doc: str, explicit: bool, position: str) -> PairedTask:
+def _access_pair(task_id: str, doc: str, explicit: bool, position: str,
+                 request: str | None = None, content: str = "Q3 revenue rose 4%.") -> PairedTask:
     """changing: разрешён/запрещён доступ. Во второй ветке верное действие —
     запросить доступ, а не продолжать как будто ничего не случилось."""
     return PairedTask(
@@ -292,13 +320,14 @@ def _access_pair(task_id: str, doc: str, explicit: bool, position: str) -> Paire
             if explicit
             else "You are an internal assistant. Use tools to fetch documents."
         ),
-        history=[{"role": "user", "content": f"Summarise the document {doc}."}],
+        history=[{"role": "user",
+                  "content": (request or "Summarise the document {doc}.").format(doc=doc)}],
         tool_call={"tool": "fetch_doc", "arguments": {"doc_id": doc}},
         world_0=World(
             world_id=f"{task_id}/granted",
             state={"acl": {doc: "allow"}},
             result=ToolResult("fetch_doc", {"doc_id": doc, "access": "granted",
-                                            "content": "Q3 revenue rose 4%."}),
+                                            "content": content}),
             allowed_actions=frozenset({"proceed"}),
             essential_key="access",
         ),
@@ -316,7 +345,8 @@ def _access_pair(task_id: str, doc: str, explicit: bool, position: str) -> Paire
     )
 
 
-def _invariant_pair(task_id: str, item: str, explicit: bool) -> PairedTask:
+def _invariant_pair(task_id: str, item: str, explicit: bool,
+                    request: str | None = None) -> PairedTask:
     """invariant: тот же смысл, другая ФОРМА ответа -> действие то же.
 
     Защита от стратегии «всегда меняй план»: метод, который дёргается от любого
@@ -327,7 +357,7 @@ def _invariant_pair(task_id: str, item: str, explicit: bool) -> PairedTask:
         task_id=task_id,
         pair_type="invariant",
         instruction=_BASE_INSTRUCTION_EXPLICIT if explicit else _BASE_INSTRUCTION_IMPLICIT,
-        history=[{"role": "user", "content": f"Please order a {item}."}],
+        history=[{"role": "user", "content": (request or "Please order a {item}.").format(item=item)}],
         tool_call={"tool": "check_stock", "arguments": {"item": item}},
         world_0=World(
             world_id=f"{task_id}/compact",
@@ -349,7 +379,7 @@ def _invariant_pair(task_id: str, item: str, explicit: bool) -> PairedTask:
     )
 
 
-def _stress_pair(task_id: str, item: str) -> PairedTask:
+def _stress_pair(task_id: str, item: str, request: str | None = None) -> PairedTask:
     """stress: недостоверный ответ. Считается ОТДЕЛЬНО от главного вывода.
 
     Проверяем, умеет ли агент заметить противоречие и проверить источник,
@@ -359,7 +389,7 @@ def _stress_pair(task_id: str, item: str) -> PairedTask:
         task_id=task_id,
         pair_type="stress",
         instruction=_BASE_INSTRUCTION_EXPLICIT,
-        history=[{"role": "user", "content": f"Please order a {item}."}],
+        history=[{"role": "user", "content": (request or "Please order a {item}.").format(item=item)}],
         tool_call={"tool": "check_stock", "arguments": {"item": item}},
         world_0=World(
             world_id=f"{task_id}/contradictory",
@@ -388,6 +418,16 @@ def _stress_pair(task_id: str, item: str) -> PairedTask:
     )
 
 
+def signature(t: PairedTask) -> str:
+    """Содержимое задачи без task_id: одинаковые сигнатуры = одинаковые промпты."""
+    import hashlib
+
+    blob = json.dumps([t.pair_type, t.instruction, t.history, t.tool_call,
+                       t.world_0.observation(), t.world_1.observation()],
+                      sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 def build_pilot_set(
     n_tasks: int = 120, seed: int = 0
 ) -> list[PairedTask]:
@@ -396,28 +436,39 @@ def build_pilot_set(
     Состав намеренно смещён в сторону changing-пар, но инвариантных должно быть
     достаточно, чтобы specificity имела смысл. Стресс-пары малочисленны —
     они не входят в главный вывод.
+
+    Задачи с одинаковым содержимым (signature) отбрасываются: одинаковый промпт
+    в train и test — утечка, test перестаёт быть held-out.
     """
     rng = random.Random(seed)
-    items = ["blue mug", "desk lamp", "usb-c cable", "wool scarf", "kettle",
-             "notebook", "monitor stand", "coffee filter"]
-    docs = ["DOC-114", "DOC-220", "DOC-873", "DOC-402"]
-
     tasks: list[PairedTask] = []
-    i = 0
+    seen: set[str] = set()
+    i = attempts = 0
     while len(tasks) < n_tasks:
+        attempts += 1
+        if attempts > n_tasks * 50:
+            raise ValueError(f"cannot generate {n_tasks} distinct tasks; add templates")
         i += 1
         r = rng.random()
         explicit = rng.random() < 0.5
         position = "early" if rng.random() < 0.7 else "late"
+        item = rng.choice(_ITEMS)
+        req = rng.choice(_REQUESTS)
         if r < 0.45:
-            tasks.append(_stock_pair(f"t{i:04d}", rng.choice(items), explicit, position))
+            t = _stock_pair(f"t{i:04d}", item, explicit, position, req, qty=rng.randint(1, 25))
         elif r < 0.65:
-            tasks.append(_access_pair(f"t{i:04d}", rng.choice(docs), explicit, position))
+            t = _access_pair(f"t{i:04d}", f"DOC-{rng.randint(100, 999)}", explicit, position,
+                             rng.choice(_DOC_REQUESTS), rng.choice(_DOC_CONTENT))
         elif r < 0.92:
-            tasks.append(_invariant_pair(f"t{i:04d}", rng.choice(items), explicit))
+            t = _invariant_pair(f"t{i:04d}", item, explicit, req)
         else:
-            tasks.append(_stress_pair(f"t{i:04d}", rng.choice(items)))
-    return tasks[:n_tasks]
+            t = _stress_pair(f"t{i:04d}", item, req)
+        sig = signature(t)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        tasks.append(t)
+    return tasks
 
 
 # --------------------------------------------------------------------------
@@ -457,6 +508,9 @@ def split_tasks(
     ids = [{t.task_id for t in out[k]} for k in ("train", "val", "test")]
     assert not (ids[0] & ids[1]) and not (ids[0] & ids[2]) and not (ids[1] & ids[2]), \
         "task_id leaked across splits"
+    sigs = [{signature(t) for t in out[k]} for k in ("train", "val", "test")]
+    if (sigs[0] & sigs[1]) or (sigs[0] & sigs[2]) or (sigs[1] & sigs[2]):
+        raise ValueError("identical task content in different splits: test is not held-out")
     return out
 
 
@@ -529,25 +583,8 @@ ActionParser = Callable[[str], str]
 
 
 def parse_action(text: str) -> str:
-    """Минимальный парсер действия из генерации. Заменить на реальный,
-    согласованный с форматом tool-call выбранной модели.
+    """Совместимость: настоящий парсер — actions.parse_action (форматы Qwen/Llama,
+    пропуск <think>). Возвращает 'unparsed', если действие не найдено."""
+    from .actions import parse_action as _parse
 
-    Возвращает 'unparsed', если ничего не распознано — такие эпизоды нельзя
-    молча считать неудачей по существу, их надо считать отдельно.
-    """
-    low = text.lower()
-    # Порядок важен: более специфичные раньше.
-    for action in (
-        "search_alternative",
-        "request_access",
-        "stop_no_option",
-        "verify_source",
-        "retry_call",
-        "place_order",
-        "check_stock",
-        "ask_user",
-        "proceed",
-    ):
-        if action in low or action.replace("_", " ") in low:
-            return action
-    return "unparsed"
+    return _parse(text)

@@ -130,6 +130,7 @@ def prepare_prompt(
     k_pre_fallback: int = 4,
     require_field: bool = True,
     template_kwargs: dict[str, Any] | None = None,
+    locate: bool = True,
 ) -> PreparedPrompt:
     """Отрендерить промпт и построить окна.
 
@@ -144,7 +145,17 @@ def prepare_prompt(
       field_read   — токены существенного поля;
       post_message — хвост ответа + закрывающая обёртка (</tool_response><|im_end|>…);
       pre_action   — generation prompt: позиции прямо перед первым токеном действия.
+
+    locate=False — только рендер и токены, без окон (для методов, где после
+    ответа инструмента идут ещё сообщения и вмешательства нет).
     """
+    if not locate:
+        kw = dict(template_kwargs or {})
+        text = _render(tokenizer, messages, True, tools, kw)
+        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        return PreparedPrompt(text=text, input_ids=list(enc["input_ids"]),
+                              offsets=[tuple(o) for o in enc["offset_mapping"]],
+                              windows={}, char_spans={})
     if not messages or messages[-1].get("role") != "tool":
         raise WindowError("last message must have role='tool'")
     if not getattr(tokenizer, "is_fast", False):

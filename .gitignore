@@ -10,9 +10,15 @@ checkpoints/
 data/raw/
 data/cache/
 
-# Результаты прогонов: таблицы и манифесты коммитим, сырые логи нет
-results/**/raw/
-results/**/*.jsonl
+# Результаты — локально. В git только то, что нужно протоколу и истории:
+# сводная таблица, журнал открытий test, замороженные методы, хеши протокола.
+results/*
+!results/.gitkeep
+!results/index.csv
+!results/test_lock.jsonl
+!results/protocol.json
+!results/frozen/
+results/frozen/*.npz
 
 # Python
 __pycache__/
@@ -29,3 +35,4 @@ venv/
 # Сборка пакета
 build/
 dist/
+

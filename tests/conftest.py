@@ -38,7 +38,12 @@ CHATML_TOOL_TEMPLATE = r"""
 def chatml_tokenizer():
     """Маленький byte-level BPE + ChatML-шаблон с ролью tool."""
     pytest.importorskip("transformers")
-    tokenizers = pytest.importorskip("tokenizers")
+    pytest.importorskip("tokenizers")
+    return make_chatml_tokenizer()
+
+
+def make_chatml_tokenizer():
+    import tokenizers
     from tokenizers import decoders, models, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
 

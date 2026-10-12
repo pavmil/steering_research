@@ -1,0 +1,71 @@
+# Полный конфиг прогона. Запуск без ноутбука:
+#   stf-run --config configs/qwen3-1.7b-mac.yaml --until probe
+# Любой ключ можно переопределить: --set steer.alphas=[1,2] --set data.n_tasks=200
+# В ноутбуке: ExperimentConfig.make(base='configs/qwen3-1.7b-mac.yaml', overrides={...})
+
+name: qwen3-1.7b-mac
+hypothesis: H3
+notebook: ''
+notes: Базовый конфиг для Mac (MPS).
+model:
+  name: Qwen/Qwen3-1.7B
+  device: auto
+  dtype: auto
+  enable_thinking: false
+  max_new_tokens: 96
+  action_prefix: null
+  action_suffix: null
+data:
+  n_tasks: 160
+  seed: 0
+  split:
+  - 0.5
+  - 0.2
+  - 0.3
+  use_tools_schema: true
+  k_post: 4
+decision:
+  mode: scored
+  n_trials: 1
+  temperature: 0.0
+probe:
+  layers: auto
+  n_auto_layers: 6
+  windows:
+  - field_read
+  - post_message
+  - pre_action
+steer:
+  layers: auto
+  top_k_layers: 3
+  windows:
+  - field_read
+  - post_message
+  - pre_action
+  alphas:
+  - 0.25
+  - 0.5
+  - 1.0
+  - 2.0
+  - 4.0
+  normalize: true
+  min_class_examples: 4
+  max_specificity_drop: 0.05
+eval:
+  methods:
+  - baseline
+  - strong_prompt
+  - restate
+  - steering
+  shams:
+  - random_direction
+  - permuted_coords
+  - layer_shift
+  - window_shift
+  strong_prompt: Before choosing your next action, re-read the most recent tool result.
+    Base the next action strictly on what that result says. If it contradicts your
+    current plan (for example, something is unavailable or access is denied), change
+    the plan accordingly instead of continuing as before.
+  n_boot: 10000
+  h2_max_sensitivity: 0.9
+  reopen_test_reason: null

@@ -274,12 +274,15 @@ def test_steering_vectors_numpy():
     assert ST.dose_response([0.0, 0.5, 1.0], lambda a: a * 2) == [(0.0, 0.0), (0.5, 1.0), (1.0, 2.0)]
 
 
-def test_mock_run_end_to_end(tmp_path):
+def test_cli_mock_run(tmp_path, monkeypatch):
     from steering_tool_feedback import run_experiment as R
 
-    rc = R.main(["--mock", "--n-tasks", "120", "--seed", "0", "--out", str(tmp_path)])
+    monkeypatch.setenv("STF_JOURNAL", str(tmp_path / "J.md"))
+    rc = R.main(["--mock", "--name", "cli", "--until", "sweep", "--results-dir",
+                 str(tmp_path / "res"), "--quiet", "--set", "eval.n_boot=200"])
     assert rc == 0
-    assert (tmp_path / "manifest.json").exists()
+    assert list((tmp_path / "res" / "runs").glob("*/manifest.json"))
+    assert (tmp_path / "J.md").exists()
 
 
 def test_module_entrypoint(tmp_path):
@@ -289,9 +292,10 @@ def test_module_entrypoint(tmp_path):
 
     run = lambda *a: subprocess.run([sys.executable, "-m", "steering_tool_feedback", *a],  # noqa: E731
                                     capture_output=True, text=True, timeout=120)
-    r = run("run", "--mock", "--out", str(tmp_path))
+    r = run("run", "--mock", "--until", "baseline", "--results-dir", str(tmp_path), "--no-journal",
+            "--quiet")
     assert r.returncode == 0, r.stderr[-500:]
-    assert (tmp_path / "manifest.json").exists()
+    assert list(tmp_path.glob("runs/*/manifest.json"))
     r = run("doctor")
     assert r.returncode == 0 and "core deps OK" in r.stdout, r.stdout[-500:]
     assert run("nope").returncode == 2

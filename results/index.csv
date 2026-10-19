@@ -1,0 +1,3 @@
+run_id,time,name,hypothesis,model,mode,stages,base_success,steer_success,paired_diff,ci,spec_drop,episode_base,episode_steer,H1,H2,H3,H4,ALT,git,dirty,notebook
+20261019-204320_model-check_0e49d9,2026-10-19 20:43,model-check,explore,Qwen/Qwen3-1.7B,scored,data,,,,,,,,not_run,not_run,· not_run,· not_run,· not_run,57bd64b,False,notebooks/02_model_check.ipynb
+20261019-204443_model-check_0e49d9,2026-10-19 20:44,model-check,explore,Qwen/Qwen3-1.7B,scored,data,,,,,,,,not_run,not_run,· not_run,· not_run,· not_run,203835d,True,notebooks/02_model_check.ipynb

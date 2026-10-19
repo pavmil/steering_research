@@ -2,3 +2,4 @@ run_id,time,name,hypothesis,model,mode,stages,base_success,steer_success,paired_
 20261019-204320_model-check_0e49d9,2026-10-19 20:43,model-check,explore,Qwen/Qwen3-1.7B,scored,data,,,,,,,,not_run,not_run,· not_run,· not_run,· not_run,57bd64b,False,notebooks/02_model_check.ipynb
 20261019-204443_model-check_0e49d9,2026-10-19 20:44,model-check,explore,Qwen/Qwen3-1.7B,scored,data,,,,,,,,not_run,not_run,· not_run,· not_run,· not_run,203835d,True,notebooks/02_model_check.ipynb
 20261019-205645_h1h2-qwen3-1.7b_7f499f,2026-10-19 20:57,h1h2-qwen3-1.7b,H2,Qwen/Qwen3-1.7B,scored,data+baseline+probe,0.946,,,,,,,support,support,· not_run,· not_run,· not_run,55e105c,True,notebooks/03_h1_h2_baseline.ipynb
+20261019-212130_h1h2-v3-qwen3-1.7b_5591bb,2026-10-19 21:21,h1h2-v3-qwen3-1.7b,H2,Qwen/Qwen3-1.7B,scored,data+baseline+probe,0.621,,,,,,,support,support,· not_run,· not_run,· not_run,09836b4,True,notebooks/05_h1_h2_v3.ipynb

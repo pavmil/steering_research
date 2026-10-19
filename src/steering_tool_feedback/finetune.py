@@ -20,6 +20,31 @@ import time
 from typing import Any
 
 
+def clean_copy(model: Any) -> Any:
+    """Копия модели без LoRA-слоёв, подключённых для оценки.
+
+    Оценочная модель после первого же решения с адаптером содержит обёртки LoRA
+    (выключенные). Если копировать её как есть, новый адаптер окажется внутри
+    выключенных слоёв, и у loss не будет градиента (найдено на Qwen3-1.7B, вторая
+    конфигурация grid). Поэтому обёртки заменяются их базовыми слоями.
+    """
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    base = copy.deepcopy(model)
+    wrapped = [(n, m) for n, m in base.named_modules() if isinstance(m, BaseTunerLayer)]
+    for name, module in wrapped:
+        parent_name, _, attr = name.rpartition(".")
+        parent = base.get_submodule(parent_name) if parent_name else base
+        setattr(parent, attr, module.get_base_layer())
+    for attr in ("peft_config", "_hf_peft_config_loaded"):
+        if hasattr(base, attr):
+            try:
+                delattr(base, attr)
+            except AttributeError:
+                setattr(base, attr, {} if attr == "peft_config" else False)
+    return base
+
+
 def train_lora(model: Any, device: str, examples: list[tuple[list[int], list[int]]], cfg: Any,
                lr: float, epochs: int, out_dir: str) -> dict[str, Any]:
     """SFT адаптера: loss только на токенах цели. Возвращает сведения о цене обучения."""
@@ -32,7 +57,7 @@ def train_lora(model: Any, device: str, examples: list[tuple[list[int], list[int
     dtype = {"float32": torch.float32, "float16": torch.float16,
              "bfloat16": torch.bfloat16}[cfg.train_dtype]
     torch.manual_seed(cfg.seed)
-    base = copy.deepcopy(model).to(dtype=dtype)
+    base = clean_copy(model).to(dtype=dtype)
     pm = get_peft_model(base, LoraConfig(r=cfg.rank, lora_alpha=cfg.lora_alpha,
                                          lora_dropout=cfg.dropout,
                                          target_modules=list(cfg.target_modules),

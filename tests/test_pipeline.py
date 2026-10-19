@@ -484,6 +484,14 @@ def _lora_checks(chatml_tokenizer, tmp_path, S, HFBackend, LoraCfg, Env, Resolve
     assert max(abs(before[k] - on[k]) for k in before) > 1e-3, "адаптер должен менять решение"
     d = be.decide(prompts[0], "scored", None, 0.0, 0, adapter=ad, with_args=True, arg_tokens=6)
     assert isinstance(d.arguments, dict) and d.n_model_calls > len(S.ACTIONS)
+    # Регрессия: второй адаптер учится, когда первый уже подключён к оценочной модели
+    info2 = be.train_adapter(examples, cfg, lr=2e-3, epochs=2, out_dir=str(tmp_path / "ad2"))
+    assert info2["epoch_losses"][-1] < info2["epoch_losses"][0], info2
+    on2 = be.decide(prompts[0], "scored", None, 0.0, 0,
+                    adapter=ResolvedAdapter("a2", str(tmp_path / "ad2"))).scores
+    off2 = be.decide(prompts[0], "scored", None, 0.0, 0).scores
+    assert max(abs(before[k] - off2[k]) for k in before) < 1e-5
+    assert max(abs(on[k] - on2[k]) for k in on) > 1e-4, "адаптеры разные"
 
 
 @pytest.mark.model

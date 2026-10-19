@@ -860,6 +860,170 @@ def build_pilot_set(n_tasks: int = 120, seed: int = 0,
 
 
 # --------------------------------------------------------------------------
+# Набор переноса (разведка): требования, которых не было в train
+# --------------------------------------------------------------------------
+#
+# Вопрос H4 — условное vs глобальное изменение. Обучаемые методы (вектор, гейт, LoRA)
+# видели в train требования «срок / количество / бюджет / наличие». Здесь половина задач —
+# те же типы на свежем seed (контроль), половина — новые требования: рейтинг и гарантия.
+# Формат ответа у обеих половин одинаковый (все поля, включая rating и warranty_months),
+# так что разница между половинами — только в том, встречался ли тип требования в train.
+# Набор генерируется отдельно от сплитов и с ними не пересекается (проверяет пайплайн).
+
+TRANSFER_SEEN = ("deadline", "quantity", "budget")
+TRANSFER_UNSEEN = ("rating", "warranty")
+_T_KEY = {**_NEED_KEY, "rating": "rating", "warranty": "warranty_months"}
+_T_REQ = {
+    "rating": ["Please order a {item}, but only if it is rated at least {rating} stars.",
+               "Order a {item} for me - it needs a rating of {rating} or higher.",
+               "Can you get me a {item}? I only buy items rated {rating}+."],
+    "warranty": ["Please order a {item} with at least {months} months of warranty.",
+                 "Order a {item} - it must come with a warranty of {months} months or more.",
+                 "Get me a {item}; I need at least a {months}-month warranty."],
+}
+_T_MULTI = {
+    "rating": ["Please order a {other} and a {item}, each rated at least {rating} stars."],
+    "warranty": ["Please order a {other} and a {item}, each with at least {months} months of warranty."],
+}
+_T_ATTR_OF_NEED = {"max_days": "ships_in_days", "budget": "price_usd", "min_rating": "rating",
+                   "min_warranty": "warranty_months"}
+
+
+def _t_meets(need: dict[str, Any], a: dict[str, Any]) -> bool:
+    return (a["qty"] >= need.get("qty", 1) and a["ships_in_days"] <= need.get("max_days", 10 ** 6)
+            and a["price_usd"] <= need.get("budget", 10 ** 6)
+            and a["rating"] >= need.get("min_rating", 0) and a["warranty_months"] >= need.get("min_warranty", 0))
+
+
+def _t_need(g: _V3Rng, kind: str) -> dict[str, Any]:
+    if kind == "rating":
+        return {"min_rating": g.r.choice([4.0, 4.2, 4.5])}
+    if kind == "warranty":
+        return {"min_warranty": g.r.choice([12, 18, 24])}
+    return g.need(kind)
+
+
+def _t_attrs(g: _V3Rng, kind: str, need: dict[str, Any], ok: bool) -> dict[str, Any]:
+    """Все поля товара; существенное выполняет (ok) или нарушает требование, прочие его не нарушают."""
+    r = g.r
+    old = kind in _NEEDS
+    qty, ships, price = g.fields(kind if old else "none", need if old else {}, ok if old else True)
+    rating, warranty = round(r.uniform(3.0, 5.0), 1), r.choice([0, 6, 12, 24, 36])
+    if kind == "rating":
+        m = need["min_rating"]
+        rating = round(r.uniform(m, 5.0), 1) if ok else round(r.uniform(2.5, m - 0.3), 1)
+    if kind == "warranty":
+        m = need["min_warranty"]
+        warranty = m + r.choice([0, 6, 12]) if ok else r.choice([w for w in (0, 3, 6, 9, 12) if w < m])
+    return {"qty": qty, "ships_in_days": ships, "price_usd": price, "rating": rating,
+            "warranty_months": warranty}
+
+
+def _t_payload(item: str, a: dict[str, Any]) -> dict[str, Any]:
+    return {"item": item, "in_stock": a["qty"] > 0, **a}
+
+
+def _t_world(wid: str, item: str, a: dict[str, Any], kind: str, need: dict[str, Any],
+             alts: list[tuple[str, dict[str, Any]]], ok: bool, neg: list[str], style: str = "json") -> World:
+    def attrs(x: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in x.items() if k != "qty"}
+    return World(
+        world_id=wid,
+        state={"stock": {item: a["qty"], **{n: x["qty"] for n, x in alts}},
+               "attrs": {item: attrs(a), **{n: attrs(x) for n, x in alts}},
+               "alternatives": {item: [n for n, _ in alts]}, "need": dict(need),
+               "negative": not ok, "negative_actions": list(neg)},
+        result=ToolResult("check_stock", _t_payload(item, a)),
+        allowed_actions=frozenset({"place_order"}) if ok else frozenset(neg),
+        essential_key=_T_KEY[kind], render_style=style,
+    )
+
+
+def _t_history(g: _V3Rng, kind: str, need: dict[str, Any], item: str, other: str,
+               late: bool) -> list[dict[str, Any]]:
+    fmt = {"item": item, "other": other, "days": need.get("max_days"), "qty": need.get("qty"),
+           "budget": need.get("budget"), "rating": need.get("min_rating"), "months": need.get("min_warranty")}
+    reqs, multi = ({**_NEED_REQ, **_T_REQ}, {**_NEED_MULTI, **_T_MULTI})
+    if not late:
+        return [{"role": "user", "content": g.r.choice(reqs[kind]).format(**fmt)}]
+    oa = _t_attrs(g, kind, need, True)
+    return [
+        {"role": "user", "content": g.r.choice(multi[kind]).format(**fmt)},
+        tool_call_message("check_stock", {"item": other}),
+        tool_message(ToolResult("check_stock", _t_payload(other, oa))),
+        tool_call_message("place_order", {"item": other}),
+        tool_message(ToolResult("place_order", {"status": "confirmed",
+                                                "order_id": _order_id(other, *oa.values()), "item": other})),
+    ]
+
+
+def _t_task(tid: str, g: _V3Rng, kind: str, explicit: bool, late: bool, invariant: bool) -> PairedTask:
+    r = g.r
+    item = r.choice(_ITEMS)
+    other = r.choice([x for x in _ITEMS if x != item])
+    need = _t_need(g, kind)
+    neg = ["search_alternative"] if explicit else ["ask_user", "search_alternative"]
+    pre = r.sample(_ALT_PREFIXES, 2)
+    alts = [(f"{pre[0]} {item}", _t_attrs(g, kind, need, True))]
+    if r.random() < 0.5:
+        alts.insert(0, (f"{pre[1]} {item}", _t_attrs(g, kind, need, False)))
+    hist = _t_history(g, kind, need, item, other, late)
+    common = dict(task_id=tid, instruction=_V3_SHOP_EXPLICIT if explicit else _BASE_INSTRUCTION_IMPLICIT,
+                  history=hist, tool_call={"tool": "check_stock", "arguments": {"item": item}},
+                  condition_explicit=explicit, critical_step_position="late" if late else "early")
+    if not invariant:
+        a0, a1 = _t_attrs(g, kind, need, True), _t_attrs(g, kind, need, False)
+        return PairedTask(pair_type="changing", notes=f"transfer need={kind}",
+                          world_0=_t_world(f"{tid}/meets", item, a0, kind, need, alts, True, neg),
+                          world_1=_t_world(f"{tid}/fails", item, a1, kind, need, alts, False, neg),
+                          **common)
+    ok = r.random() < 0.5
+    a0 = _t_attrs(g, kind, need, ok)
+    free = [f for f in ("ships_in_days", "price_usd", "rating", "warranty_months")
+            if f != _T_KEY[kind] and f not in {_T_ATTR_OF_NEED[k] for k in need if k in _T_ATTR_OF_NEED}]
+    f = r.choice(free)
+    a1 = dict(a0)
+    a1[f] = {"ships_in_days": r.randint(1, 14), "price_usd": r.randint(8, 120),
+             "rating": round(r.uniform(3.0, 5.0), 1), "warranty_months": r.choice([0, 6, 12, 24, 36])}[f]
+    styles, variant = ("json", "json"), "irrelevant"
+    if r.random() < 0.5 or a1 == a0 or _t_meets(need, a1) != _t_meets(need, a0):
+        a1, styles, variant = a0, ("json", r.choice(["verbose_json", "prose"])), "form"
+    return PairedTask(pair_type="invariant",
+                      notes=f"transfer invariant={variant} need={kind} {'meets' if ok else 'fails'}",
+                      world_0=_t_world(f"{tid}/a", item, a0, kind, need, alts, ok, neg, styles[0]),
+                      world_1=_t_world(f"{tid}/b", item, a1, kind, need, alts, ok, neg, styles[1]),
+                      **common)
+
+
+def build_transfer_set(n_tasks: int = 80, seed: int = 101, seen: tuple[str, ...] = TRANSFER_SEEN,
+                       unseen: tuple[str, ...] = TRANSFER_UNSEEN) -> dict[str, list[PairedTask]]:
+    """{"seen": задачи знакомых типов, "unseen": новых}, поровну; 70% меняющих, 30% инвариантных."""
+    for k in (*seen, *unseen):
+        if k not in _T_KEY:
+            raise ValueError(f"unknown requirement kind {k!r}")
+    rng = random.Random(seed)
+    g = _V3Rng(rng)
+    out: dict[str, list[PairedTask]] = {"seen": [], "unseen": []}
+    sigs: set[str] = set()
+    i = attempts = 0
+    while len(out["seen"]) + len(out["unseen"]) < n_tasks:
+        attempts += 1
+        if attempts > n_tasks * 50:
+            raise ValueError(f"cannot generate {n_tasks} distinct transfer tasks")
+        i += 1
+        group = "seen" if len(out["seen"]) <= len(out["unseen"]) else "unseen"
+        kind = rng.choice(seen if group == "seen" else unseen)
+        t = _t_task(f"x{i:04d}", g, kind, rng.random() < 0.5, rng.random() >= 0.7,
+                    invariant=rng.random() >= 0.7)
+        sig = signature(t)
+        if sig in sigs:
+            continue
+        sigs.add(sig)
+        out[group].append(t)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Разбиение и аудит
 # --------------------------------------------------------------------------
 

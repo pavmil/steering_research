@@ -170,3 +170,23 @@ def test_late_position_has_real_history(tasks):
         assert t.prompt(0)[:-1] == t.prompt(1)[:-1], "история и вызов одинаковы в обеих ветках"
     for t in early:
         assert sum(1 for m in t.prompt(0) if m.get("tool_calls")) == 1
+
+
+def test_transfer_set_new_requirements():
+    """Набор переноса: новые типы требований (рейтинг, гарантия) в том же формате ответа,
+    что и знакомые; среда проверяет и новые требования."""
+    sets = S.build_transfer_set(60, seed=101)
+    assert len(sets["seen"]) == len(sets["unseen"]) == 30
+    kinds = {g: {t.notes.split("need=")[1].split()[0] for t in v} for g, v in sets.items()}
+    assert kinds["unseen"] <= {"rating", "warranty"} and kinds["seen"] <= {"deadline", "quantity", "budget"}
+    for g, v in sets.items():
+        assert S.audit(v).ok
+        for t in v:
+            for b in (0, 1):
+                assert {"rating", "warranty_months"} <= set(t.branch(b).result.payload)
+    t = next(t for t in sets["unseen"] if t.pair_type == "changing")
+    env = E.Env(t, 1)
+    env.step("place_order", {"item": t.tool_call["arguments"]["item"]})
+    assert env.done and not env.goal and any("does not meet" in v for v in env.violations)
+    v3 = {S.signature(x) for x in S.build_pilot_set(160, seed=0, version="v3")}
+    assert not v3 & {S.signature(x) for v in sets.values() for x in v}

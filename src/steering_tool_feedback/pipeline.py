@@ -307,7 +307,7 @@ class Experiment:
                 for t, b, k in _progress(jobs, f"{tag or method}/{split}", len(jobs),
                                          disable=not self.verbose)]
         if write:
-            write_jsonl(self.dir / "decisions" / f"{split}__{(tag or method).replace(':', '-')}.jsonl",
+            write_jsonl(self.dir / "decisions" / f"{split.replace(':', '-')}__{(tag or method).replace(':', '-')}.jsonl",
                         recs)
         return recs
 
@@ -352,7 +352,7 @@ class Experiment:
                                         disable=not self.verbose)]
         if write:
             name = (tag or method).replace(":", "-")
-            write_jsonl(self.dir / "decisions" / f"{split}__episodes__{name}.jsonl", eps)
+            write_jsonl(self.dir / "decisions" / f"{split.replace(':', '-')}__episodes__{name}.jsonl", eps)
         return eps
 
     def summarize_episodes(self, eps: list[dict], base: list[dict] | None = None) -> dict[str, Any]:
@@ -907,6 +907,60 @@ class Experiment:
         self.log("val: " + "; ".join(f"{k} {v['success']:.3f}"
                                      for k, v in self.state["summaries"]["val"].items()))
 
+    def transfer(self) -> dict[str, Any]:
+        """Разведка переноса: методы, выбранные на val (стадия fit), без какого-либо подбора —
+        на задачах со знакомыми типами требований (seen, свежий seed) и с новыми (unseen).
+
+        Test-сплит не используется; набор генерируется отдельно и не должен пересекаться ни с
+        одним сплитом по содержимому. Разница seen − unseen в приросте метода — его переносимость
+        (один из критериев 2604.14090). Результат разведочный: подтверждать на отложенных данных.
+        """
+        self._need("fit")
+        c = self.cfg.transfer
+        sets = S.build_transfer_set(c.n_tasks, c.seed, tuple(c.seen), tuple(c.unseen))
+        known = {S.signature(t) for k, v in self.state["splits"].items()
+                 if not k.startswith("transfer:") for t in v}
+        res: dict[str, Any] = {"cfg": {"n_tasks": c.n_tasks, "seed": c.seed, "seen": list(c.seen),
+                                       "unseen": list(c.unseen)}}
+        for name, tasks in sets.items():
+            if {S.signature(t) for t in tasks} & known:
+                raise ValueError("transfer set overlaps train/val/test by content")
+            split = f"transfer:{name}"
+            self.state["splits"][split] = tasks
+            base = self.evaluate("baseline", split)
+            recs_by: dict[str, list[dict]] = {"baseline": base}
+            self.state["summaries"][split]["baseline"] = self.summarize(base)
+            for m in self.cfg.eval.methods:
+                if m == "baseline":
+                    continue
+                spec = get_method(m)
+                specs = self._specs_for(m) if (spec.steer or spec.fitted) else {}
+                if specs is None:
+                    continue
+                recs_by[m] = self.evaluate(m, split, **specs)
+                self.state["summaries"][split][m] = self.summarize(recs_by[m], base)
+            out = {"methods": dict(self.state["summaries"][split]),
+                   "comparisons": self._comparisons(recs_by), "episodes": {}}
+            if self.cfg.episode.enabled:
+                eps = {}
+                for m in c.episode_methods:
+                    if m not in recs_by:
+                        continue
+                    spec = get_method(m)
+                    specs = self._specs_for(m) if (spec.steer or spec.fitted) else {}
+                    eps[m] = self.evaluate_episodes(m, split, **(specs or {}))
+                for m, e in eps.items():
+                    out["episodes"][m] = self.summarize_episodes(
+                        e, None if m == "baseline" else eps.get("baseline"))
+                self.state["episodes"][split] = out["episodes"]
+            res[name] = out
+            self.log(f"transfer {name}: " + "; ".join(
+                f"{k} {v['success']:.3f}" for k, v in out["methods"].items()))
+        self.state["transfer"] = res
+        self._save_json("transfer.json", res)
+        self._mark("transfer")
+        return res
+
     def _comparisons(self, recs_by: dict[str, list[dict]]) -> dict[str, Any]:
         out = {}
         if "steering" in recs_by:
@@ -1170,17 +1224,19 @@ class Experiment:
 
         return pd.DataFrame(((self.state.get("fitted") or {}).get(method) or {}).get("rows") or [])
 
-    def _md_table(self) -> str:
-        df = self.results_table()
+    def _md_table(self, split: str | None = None) -> str:
+        split = split or ("test" if "test" in self.done else "val")
+        df = self.results_table(split)
         if df.empty:
             return ""
-        split = "test" if "test" in self.done else "val"
         cols = [c for c in ("method", "success", "sensitivity", "specificity", "diff_vs_base", "ci",
                             "fixed", "broken", "episode", "ep_diff", "tokens", "calls", "p50_ms")
                 if c in df.columns and not (c in ("episode", "ep_diff") and df[c].isna().all())]
         head = "| " + " | ".join(cols) + " |"
         sep = "|" + "---|" * len(cols)
-        lines = [f"**Результаты ({split}):**", "", head, sep]
+        title = (f"**Перенос, {split.split(':', 1)[1]} (разведка):**" if split.startswith("transfer:")
+                 else f"**Результаты ({split}):**")
+        lines = [title, "", head, sep]
 
         def fmt(x: Any) -> str:
             if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -1229,7 +1285,10 @@ class Experiment:
              "mode": self.cfg.decision.mode, "stages": self.done, "git": self.git["commit"],
              "dirty": self.git["dirty"], "notes": self.cfg.notes,
              "diff": self.cfg.diff_from_default(), "flags": list(dict.fromkeys(self.flags)),
-             "table": self._md_table(), "verdicts": v, "conclusion": conclusion,
+             "table": "\n\n".join(t for t in [self._md_table()] + [
+                 self._md_table(k) for k in ("transfer:seen", "transfer:unseen")
+                 if self.state["summaries"].get(k)] if t),
+             "verdicts": v, "conclusion": conclusion,
              "next_step": next_step}
         block = J.run_entry(self.store.root, f) if journal else ""
         md = block or "\n".join([f"# {self.run_id}", f["table"]])

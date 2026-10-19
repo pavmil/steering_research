@@ -132,6 +132,17 @@ class TactCfg:
 
 
 @dataclass
+class TransferCfg:
+    # Разведка переноса (Experiment.transfer): методы, выбранные на val, на задачах с типами
+    # требований, которых не было в train (unseen), и со знакомыми типами на свежем seed (seen).
+    n_tasks: int = 100
+    seed: int = 101
+    seen: list[str] = field(default_factory=lambda: ["deadline", "quantity", "budget"])
+    unseen: list[str] = field(default_factory=lambda: ["rating", "warranty"])
+    episode_methods: list[str] = field(default_factory=lambda: ["baseline", "steering", "lora"])
+
+
+@dataclass
 class EvalCfg:
     methods: list[str] = field(default_factory=lambda: ["baseline", "strong_prompt", "steering"])
     shams: list[str] = field(default_factory=lambda: list(SHAMS))
@@ -156,6 +167,7 @@ class ExperimentConfig:
     lora: LoraCfg = field(default_factory=LoraCfg)
     gate: GateCfg = field(default_factory=GateCfg)
     tact: TactCfg = field(default_factory=TactCfg)
+    transfer: TransferCfg = field(default_factory=TransferCfg)
     eval: EvalCfg = field(default_factory=EvalCfg)
 
     _DESCRIPTIVE = ("name", "hypothesis", "notes", "notebook")
@@ -250,7 +262,7 @@ def load_yaml(path: str | Path) -> ExperimentConfig:
 
 
 _SECTIONS = ("model", "data", "decision", "probe", "steer", "episode", "lora", "gate", "tact",
-             "eval")
+             "transfer", "eval")
 
 
 def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:

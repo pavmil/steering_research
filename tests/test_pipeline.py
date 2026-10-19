@@ -328,7 +328,7 @@ def test_hf_pipeline_end_to_end(chatml_tokenizer, root):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["01_smoke_mock.ipynb", "00_TEMPLATE.ipynb", "05_h1_h2_v3.ipynb",
+@pytest.mark.parametrize("name", ["01_smoke_mock.ipynb", "00_TEMPLATE.ipynb", "05_h1_h2_v3.ipynb", "06_transfer.ipynb",
                                   "03_h1_h2_baseline.ipynb", "04_h3_steering.ipynb"])
 def test_notebooks_execute_on_mock(name, tmp_path, monkeypatch):
     nbformat = pytest.importorskip("nbformat")
@@ -526,3 +526,27 @@ def test_hf_system_prefix_cache_and_batched_candidates(chatml_tokenizer, tiny_mo
         b, n2, _ = be._generate(ids, steer, 0.0, 0, max_new_tokens=5,
                                 prefix=be._system_prefix(ids, p.messages, p.tools, steer))
         assert a == b and n1 == n2
+
+
+def test_transfer_stage_on_mock(root, monkeypatch):
+    exp = _exp(root, **{"eval.methods": ALL_METHODS, "transfer.n_tasks": 40})
+    exp.data()
+    with pytest.raises(StageOrderError):
+        exp.transfer()
+    exp.run("fit")
+    res = exp.transfer()
+    assert {"seen", "unseen"} <= set(res)
+    for g in ("seen", "unseen"):
+        assert {"baseline", "steering", "lora"} <= set(res[g]["methods"])
+        assert set(res[g]["episodes"]) == {"baseline", "steering", "lora"}
+        assert "steering_vs_lora" in res[g]["comparisons"]
+    assert not list((exp.dir / "decisions").glob("test__*")), "перенос не открывает test"
+    md = exp.report()
+    assert "Перенос, unseen (разведка)" in md
+    # набор, совпадающий со сплитом по содержимому, — ошибка
+    exp2 = _exp(root, **{"eval.methods": ["baseline"]})
+    exp2.run("fit")
+    train = exp2.state["splits"]["train"]
+    monkeypatch.setattr(S, "build_transfer_set", lambda *a, **k: {"seen": train, "unseen": train})
+    with pytest.raises(ValueError, match="overlaps"):
+        exp2.transfer()

@@ -95,6 +95,10 @@ class Env:
             return False
         if "max_days" in need and a.get("ships_in_days", 0) > need["max_days"]:
             return False
+        if "min_rating" in need and a.get("rating", 0) < need["min_rating"]:
+            return False
+        if "min_warranty" in need and a.get("warranty_months", 0) < need["min_warranty"]:
+            return False
         return not ("budget" in need and a.get("price_usd", 0) > need["budget"])
 
     def _negative_actions(self) -> frozenset[str]:

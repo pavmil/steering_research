@@ -9,7 +9,8 @@ Probe — ИНСТРУМЕНТ ОТБОРА слоя и окна, а не рез
   * accuracy/AUROC против честной базовой частоты;
   * контроль на перестановке метк (должен упасть до случайного);
   * проверка, не читает ли probe поверхностную форму (shortcut-тест
-    на инвариантных парах, где форма меняется, а смысл нет).
+    на инвариантных парах, где форма меняется, а смысл нет): тот же probe
+    состояния применяется к обеим формам инвариантной пары.
 
 Только sklearn/numpy — без torch.
 """
@@ -36,6 +37,7 @@ class ProbeResult:
     permuted_accuracy: float
     n: int
     shortcut_auroc: float | None = None
+    invariant_transfer: float | None = None
 
     # Запас, который должен быть у сигнала над обеими нулевыми моделями.
     MARGIN = 0.05
@@ -58,7 +60,12 @@ class ProbeResult:
 
     @property
     def suspected_shortcut(self) -> bool:
-        """Probe уверенно отличает ИНВАРИАНТНЫЕ ветки -> читает форму, не смысл."""
+        """Probe состояния уверенно разделяет ИНВАРИАНТНЫЕ ветки -> читает форму, не смысл.
+
+        shortcut_auroc — max(AUROC, 1 − AUROC) оценки probe по метке формы: 0.5 = форма
+        на оценку не влияет. Сравнивается ТОТ ЖЕ probe, что обучен на состоянии, — новый
+        классификатор формы отличит её всегда (это разные токены) и ничего не проверит.
+        """
         return self.shortcut_auroc is not None and self.shortcut_auroc > 0.65
 
     def __str__(self) -> str:
@@ -70,6 +77,8 @@ class ProbeResult:
         )
         if self.shortcut_auroc is not None:
             s += f" shortcut={self.shortcut_auroc:.3f}"
+        if self.invariant_transfer is not None:
+            s += f" transfer={self.invariant_transfer:.3f}"
         flags = []
         if not self.beats_baseline:
             flags.append("NO SIGNAL")
@@ -113,6 +122,7 @@ def run_probe(
     invariant_activations: Sequence[np.ndarray] | None = None,
     invariant_labels: Sequence[int] | None = None,
     invariant_task_ids: Sequence[str] | None = None,
+    invariant_states: Sequence[int] | None = None,
 ) -> ProbeResult:
     """Обучить probe и посчитать все контроли.
 
@@ -121,7 +131,10 @@ def run_probe(
     task_ids    — для группировки: обе ветки одной задачи в один фолд.
 
     invariant_* — опционально: ветки инвариантных пар с метками «какая форма».
-                  Если probe их хорошо различает, он читает форму, а не смысл.
+                  Probe состояния (обученный на всех меняющих парах) применяется к ним:
+                  если его оценка разделяет формы — он читает форму, а не смысл.
+    invariant_states — истинное состояние инвариантных веток (одно на пару): доля
+                  веток, отнесённых probe к нему, — перенос между формами.
     """
     X = np.stack([np.asarray(a, dtype=float) for a in activations])
     y = np.asarray(labels, dtype=int)
@@ -147,19 +160,20 @@ def run_probe(
     except ValueError:
         perm_acc = majority
 
-    shortcut = None
+    shortcut = transfer = None
     if invariant_activations is not None and invariant_labels is not None:
         Xi = np.stack([np.asarray(a, dtype=float) for a in invariant_activations])
         yi = np.asarray(invariant_labels, dtype=int)
-        gi = np.asarray(
-            invariant_task_ids if invariant_task_ids is not None
-            else np.arange(len(yi)).astype(str)
-        )
+        scaler = StandardScaler().fit(X)
+        clf = LogisticRegression(max_iter=2000, C=1.0, random_state=seed)
+        clf.fit(scaler.transform(X), y)
+        pi = clf.predict_proba(scaler.transform(Xi))[:, 1]
         if len(np.unique(yi)) >= 2:
-            try:
-                _, shortcut = _fit_cv(Xi, yi, gi, seed, n_splits)
-            except ValueError:
-                shortcut = None
+            a = float(roc_auc_score(yi, pi))
+            shortcut = max(a, 1.0 - a)
+        if invariant_states is not None:
+            st = np.asarray(invariant_states, dtype=int)
+            transfer = float(np.mean((pi > 0.5).astype(int) == st))
 
     return ProbeResult(
         layer=layer,
@@ -170,6 +184,7 @@ def run_probe(
         permuted_accuracy=perm_acc,
         n=int(X.shape[0]),
         shortcut_auroc=shortcut,
+        invariant_transfer=transfer,
     )
 
 

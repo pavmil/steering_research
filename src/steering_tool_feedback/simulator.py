@@ -691,6 +691,17 @@ def audit(tasks: list[PairedTask]) -> AuditReport:
 # --------------------------------------------------------------------------
 
 
+def semantic_state(world: World) -> int:
+    """Смысл ответа в метках probe: 1 — «нет» (товара нет, доступ запрещён), 0 — «да».
+    Совпадает с номером ветки меняющих пар; для инвариантных пар — их общее состояние."""
+    p = world.result.payload
+    if "in_stock" in p:
+        return 0 if p["in_stock"] else 1
+    if "access" in p:
+        return 0 if p["access"] == "granted" else 1
+    raise ValueError(f"{world.world_id}: unknown semantic state")
+
+
 def score_action(action: str, world: World) -> bool:
     """Попало ли действие в множество допустимых A*.
 

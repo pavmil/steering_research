@@ -544,13 +544,15 @@ class Experiment:
                         L, w, seed=self.cfg.data.seed,
                         invariant_activations=[a[k] for a in inv_a] or None,
                         invariant_labels=[b for _, b, _ in inv_p] or None,
-                        invariant_task_ids=[t.task_id for t, _, _ in inv_p] or None)
+                        invariant_task_ids=[t.task_id for t, _, _ in inv_p] or None,
+                        invariant_states=[S.semantic_state(t.branch(b)) for t, b, _ in inv_p] or None)
                 except ValueError as e:
                     self.log(f"probe L{L}/{w}: skipped ({e})")
                     continue
                 rows.append({"layer": L, "window": w, "accuracy": r.accuracy, "auroc": r.auroc,
                              "majority": r.majority_baseline, "permuted_accuracy": r.permuted_accuracy,
-                             "shortcut_auroc": r.shortcut_auroc, "beats_baseline": r.beats_baseline,
+                             "shortcut_auroc": r.shortcut_auroc,
+                             "invariant_transfer": r.invariant_transfer, "beats_baseline": r.beats_baseline,
                              "suspected_shortcut": r.suspected_shortcut, "n": r.n})
         self.state["probe_rows"] = rows
         self.state["probe_layers"], self.state["probe_windows"] = layers, windows

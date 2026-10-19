@@ -211,12 +211,48 @@ def test_probe_no_false_signal():
     assert not r.beats_baseline, str(r)
 
 
+def _form_blobs(form_dir, sep_state=3.0, sep_form=3.0, n=40, h=32, seed=5):
+    """Меняющие пары: состояние по оси d. Инвариантные: состояние 1, форма по оси form_dir."""
+    rng = np.random.default_rng(seed)
+    d = np.zeros(h)
+    d[0] = 1.0
+    acts, labels, ids = [], [], []
+    for i in range(n):
+        for b in (0, 1):
+            acts.append(rng.normal(size=h) + sep_state * b * d)
+            labels.append(b)
+            ids.append(f"t{i}")
+    ia, il, ii = [], [], []
+    for i in range(n):
+        for f in (0, 1):
+            ia.append(rng.normal(size=h) + sep_state * d + sep_form * (f - 0.5) * form_dir)
+            il.append(f)
+            ii.append(f"i{i}")
+    return acts, labels, ids, ia, il, ii
+
+
 def test_probe_flags_shortcut():
-    acts, labels, ids = _blobs(3.0)
-    ia, il, ii = _blobs(3.0, seed=2, prefix="i")
-    r = P.run_probe(acts, labels, ids, 5, "post_message", seed=0,
-                    invariant_activations=ia, invariant_labels=il, invariant_task_ids=ii)
+    """Форма сдвигает оценку probe состояния -> shortcut."""
+    h = 32
+    along = np.zeros(h)
+    along[0] = 1.0
+    acts, labels, ids, ia, il, ii = _form_blobs(along, sep_form=4.0)
+    r = P.run_probe(acts, labels, ids, 5, "post_message", seed=0, invariant_activations=ia,
+                    invariant_labels=il, invariant_task_ids=ii, invariant_states=[1] * len(il))
     assert r.suspected_shortcut
+
+
+def test_probe_form_on_orthogonal_axis_is_not_a_shortcut():
+    """Регрессия: форма различима, но probe состояния её не читает -> не shortcut.
+    Старый тест обучал отдельный классификатор формы и срабатывал бы всегда."""
+    h = 32
+    ortho = np.zeros(h)
+    ortho[1] = 1.0
+    acts, labels, ids, ia, il, ii = _form_blobs(ortho, sep_form=4.0)
+    r = P.run_probe(acts, labels, ids, 5, "post_message", seed=0, invariant_activations=ia,
+                    invariant_labels=il, invariant_task_ids=ii, invariant_states=[1] * len(il))
+    assert not r.suspected_shortcut and r.beats_baseline, str(r)
+    assert r.invariant_transfer > 0.7
 
 
 def test_probe_input_validation():

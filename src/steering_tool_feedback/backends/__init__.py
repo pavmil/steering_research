@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from .base import Backend, Decision, Prompt, ResolvedSteer, auto_layers
+from .base import (Backend, Decision, Intervention, Prompt, ResolvedAdapter, ResolvedSteer,
+                   ResolvedTact, auto_layers)
 from .mock import MockBackend
 
-__all__ = ["Backend", "Decision", "MockBackend", "Prompt", "ResolvedSteer", "auto_layers",
-           "load_backend"]
+__all__ = ["Backend", "Decision", "Intervention", "MockBackend", "Prompt", "ResolvedAdapter",
+           "ResolvedSteer", "ResolvedTact", "auto_layers", "load_backend"]
 
 
 def load_backend(model_cfg) -> Backend:

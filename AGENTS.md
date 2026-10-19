@@ -83,8 +83,9 @@ chat template до первого прогона: `stf-windows --tokenizer <...>
 В модель подавать **только** `PreparedPrompt.input_ids` / `.model_inputs()` —
 тогда окна и вход не разъедутся.
 
-Четыре окна: `tool_content` (текст ответа), `field_read` (ключ+значение существенного поля),
-`post_message` (хвост ответа + закрывающая обёртка шаблона), `pre_action` (generation prompt).
+Пять окон: `tool_content` (текст ответа), `field_read` (ключ+значение существенного поля),
+`post_message` (хвост ответа + закрывающая обёртка шаблона), `pre_action` (generation prompt),
+`action_point` (последний токен промпта — точка выбора действия; окно адаптации TACT).
 
 **Хуки.** После каждого прогона со steering проверять `hook.n_applied == len(window)`
 (0 = окно мимо; «нулевой эффект» тогда ничего не значит) и

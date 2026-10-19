@@ -10,12 +10,17 @@
     и окнам — probe находит состояние, CAA по исходам находит использование;
   * steering по вектору, сонаправленному с «использованием», повышает долю
     верных переключений; любое возмущение (в т.ч. sham) с ростом alpha
-    ломает инвариантные пары. Поэтому подбор alpha — настоящий компромисс.
+    ломает инвариантные пары. Поэтому подбор alpha — настоящий компромисс;
+  * TACT, LoRA и двухшаговые методы дают свои синтетические эффекты;
+  * на шагах продолжения эпизода агент почти всегда прав; аргументы
+    вызова берутся из последнего ответа инструмента.
 """
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -23,12 +28,14 @@ import numpy as np
 from .. import simulator as S
 from ..store import sha
 from ..windows import PositionWindow
-from .base import Decision, Prompt, ResolvedSteer
+from .base import Decision, Prompt, ResolvedSteer, ResolvedTact
 
 _WIN = {"tool_content": (100, 120), "field_read": (105, 108),
-        "post_message": (116, 124), "pre_action": (124, 128)}
-_STATE_W = {"tool_content": 0.8, "field_read": 1.0, "post_message": 0.6, "pre_action": 0.4}
-_USE_W = {"tool_content": 0.5, "field_read": 0.6, "post_message": 1.0, "pre_action": 0.8}
+        "post_message": (116, 124), "pre_action": (124, 128), "action_point": (127, 128)}
+_STATE_W = {"tool_content": 0.8, "field_read": 1.0, "post_message": 0.6, "pre_action": 0.4,
+            "action_point": 0.4}
+_USE_W = {"tool_content": 0.5, "field_read": 0.6, "post_message": 1.0, "pre_action": 0.8,
+          "action_point": 0.9}
 
 
 def _u(*parts: Any) -> float:
@@ -38,13 +45,13 @@ def _u(*parts: Any) -> float:
 class MockBackend:
     def __init__(self, n_layers: int = 12, hidden: int = 48, use_rate: float = 0.35,
                  gain: float = 0.9, cost: float = 0.015, sep: float = 1.6, seed: int = 0):
-        self.model_key = f"mock-v1-L{n_layers}-h{hidden}-s{seed}"
+        self.model_key = f"mock-v2-L{n_layers}-h{hidden}-s{seed}"
         self.n_layers, self.hidden_size = n_layers, hidden
         self.use_rate, self.gain, self.cost, self.sep = use_rate, gain, cost, sep
         rng = np.random.default_rng(seed)
         self._state = self._unit(rng.normal(size=(n_layers, hidden)))
         self._use = self._unit(rng.normal(size=(n_layers, hidden)))
-        self.calls = {"decide": 0, "record": 0}
+        self.calls = {"decide": 0, "record": 0, "train": 0}
 
     @staticmethod
     def _unit(m: np.ndarray) -> np.ndarray:
@@ -84,9 +91,15 @@ class MockBackend:
                 out[(L, w)] = a.astype(np.float32)
         return out
 
-    def _steer_effect(self, steer: ResolvedSteer | None) -> tuple[float, float]:
+    def _steer_effect(self, steer) -> tuple[float, float]:
         if steer is None:
             return 0.0, 0.0
+        if isinstance(steer, ResolvedTact):
+            cos = float(np.mean([abs(float(ax.unit @ self._use[ax.layer])) * self._profile(ax.layer)
+                                 for ax in steer.axes]))
+            good = self.gain * 0.8 * cos * (1 - math.exp(-steer.lam))
+            return good, min(self.cost * 0.4 * steer.lam, 0.9)
+        assert isinstance(steer, ResolvedSteer)
         L = steer.vector.layer
         cos = float(steer.vector.unit() @ self._use[L])
         # Вмешательство до ответа инструмента не может помочь его учесть.
@@ -98,8 +111,12 @@ class MockBackend:
 
     def _decide(self, p: Prompt, boost: float, harm: float, trial: int) -> str:
         allowed = p.meta["allowed"]
-        other = p.meta["other_allowed"]
+        other = p.meta.get("other_allowed", [])
         kind = p.meta["pair_type"]
+        if kind == "continuation":
+            if _u(p.key, "cont", trial) < 0.08 + harm:
+                return sorted(set(S.ACTIONS) - set(allowed))[0]
+            return allowed[0]
         if kind == "invariant":
             if _u(p.meta["task_id"], p.meta["branch"], "harm", trial) < harm:
                 return sorted(set(S.ACTIONS) - set(allowed))[0]
@@ -108,22 +125,80 @@ class MockBackend:
             return allowed[0]
         return (other or allowed)[0]
 
-    def _decision(self, p: Prompt, action: str, calls: int = 1,
-                  steer: ResolvedSteer | None = None) -> Decision:
-        scores = {a: (-0.1 if a == action else -3.0 - _u(p.key, a)) for a in S.ACTIONS}
-        return Decision(action=action, scores=scores, n_prompt_tokens=p.n_tokens,
-                        n_new_tokens=4, n_model_calls=calls,
-                        latency_ms=p.n_tokens * 0.05 * calls,
-                        hook_applied=len(steer.window) if steer else None,
-                        positions_source="mock" if steer else None)
+    @staticmethod
+    def _call_arg(msgs: list[dict], key: str) -> Any:
+        for m in reversed(msgs):
+            for tc in m.get("tool_calls") or []:
+                v = tc["function"].get("arguments", {}).get(key)
+                if v:
+                    return v
+        return None
 
-    def decide(self, prompt, mode, steer, temperature, trial):
+    def _arguments(self, p: Prompt, action: str) -> dict[str, Any]:
+        """Аргументы «как у разумного агента»: из последнего ответа инструмента."""
+        last = next((m for m in reversed(p.messages) if m.get("role") == "tool"), None)
+        try:
+            payload = json.loads(last["content"]) if last else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        item = payload.get("item") or payload.get("query") or self._call_arg(p.messages, "item")
+        if action == "place_order":
+            alts = [a["item"] for a in payload.get("alternatives", []) if a.get("in_stock")]
+            return {"item": alts[0] if alts else item}
+        if action in ("search_alternative", "check_stock", "verify_source"):
+            return {"item": item}
+        if action == "request_access":
+            return {"doc_id": payload.get("doc_id") or self._call_arg(p.messages, "doc_id")}
+        if action == "ask_user":
+            return {"question": "Is an alternative fine?"}
+        if action == "stop_no_option":
+            return {"reason": "no option"}
+        return {}
+
+    def _decision(self, p: Prompt, action: str, calls: int = 1, steer=None,
+                  with_args: bool = False) -> Decision:
+        scores = {a: (-0.1 if a == action else -3.0 - _u(p.key, a)) for a in S.ACTIONS}
+        d = Decision(action=action, scores=scores, n_prompt_tokens=p.n_tokens,
+                     n_new_tokens=4, n_model_calls=calls,
+                     latency_ms=p.n_tokens * 0.05 * calls,
+                     hook_applied=len(steer.window) if steer else None,
+                     positions_source="mock" if steer else None)
+        if isinstance(steer, ResolvedTact):
+            d.hook_changed = len(steer.axes)
+        if with_args:
+            d.arguments = self._arguments(p, action)
+            d.n_new_tokens += 12
+            d.n_model_calls += 1
+        return d
+
+    def decide(self, prompt, mode, steer, temperature, trial, adapter=None, with_args=False,
+               arg_tokens=40):
         self.calls["decide"] += 1
         boost, harm = self._steer_effect(steer)
         if prompt.meta.get("variant") == "strong_prompt":
             boost += 0.12
-        return self._decision(prompt, self._decide(prompt, boost, harm, trial), steer=steer)
+        if adapter is not None:
+            boost, harm = boost + 0.3, harm + 0.04
+        return self._decision(prompt, self._decide(prompt, boost, harm, trial), steer=steer,
+                              with_args=with_args)
+
+    def decide_two_step(self, prompt, ask, go, ask_tokens, mode, temperature, trial,
+                        adapter=None, with_args=False, arg_tokens=40):
+        self.calls["decide"] += 1
+        boost = 0.24 if "STATE" in ask.upper() else 0.18
+        return self._decision(prompt, self._decide(prompt, boost, 0.0, trial), calls=2,
+                              with_args=with_args)
 
     def decide_restate(self, prompt, mode, temperature, trial):
-        self.calls["decide"] += 1
-        return self._decision(prompt, self._decide(prompt, 0.18, 0.0, trial), calls=2)
+        return self.decide_two_step(prompt, "restate", "go", 48, mode, temperature, trial)
+
+    # --- «обучение» адаптера --------------------------------------------
+    def sft_example(self, prompt, action, arguments):
+        return [len(prompt.key)], [len(action)]
+
+    def train_adapter(self, examples, lora_cfg, lr, epochs, out_dir):
+        self.calls["train"] += 1
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "adapter.json").write_text(json.dumps({"lr": lr, "epochs": epochs}))
+        return {"train_seconds": 0.0, "n_examples": len(examples), "epochs": epochs, "lr": lr,
+                "n_trainable": 0, "train_tokens": 0, "epoch_losses": []}

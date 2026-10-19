@@ -225,3 +225,79 @@ def test_end_to_end_real_template(real_tokenizer):
         assert h.positions_source in ("cache_position", "position_ids"), kind
         assert torch.allclose(clean[:, : w.start], steered[:, : w.start], atol=1e-5), kind
         assert not torch.allclose(clean[:, w.start:], steered[:, w.start:]), kind
+
+
+# --------------------------------------------------------------------------
+# TACT: проекция на ось с полосой (ProjectionHook)
+# --------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _hidden(model, batch, layer):
+    with ST.ActivationRecorder(model, [layer]) as rec:
+        model(**batch)
+    return rec.raw(layer)
+
+
+def _axis_through(model, batch, layer, pos, sigma):
+    """Ось, на которой состояние в позиции pos лежит ровно на 3·sigma от центра."""
+    h = _hidden(model, batch, layer)[pos]
+    rng = np.random.default_rng(0)
+    u = rng.normal(size=h.shape)
+    u /= np.linalg.norm(u)
+    mu = h - 3.0 * sigma * u
+    return ST.DriftAxis(layer, u.astype(np.float32), mu.astype(np.float32), sigma)
+
+
+def test_projection_hook_clamps_outside_band_only(tiny_model):
+    _, m = tiny_model
+    b = _inputs(m)
+    L, pos = 2, SEQ - 1
+    w = PositionWindow(pos, pos + 1, "action_point")
+    ax = _axis_through(m, b, L, pos, sigma=0.5)
+    clean = _logits(m, b)
+    # k = 2: проекция 3σ вне полосы 2σ -> сдвиг; lam = 1 -> ровно на границу полосы.
+    with ST.drift_clamp(m, [ax], w, k=2.0, lam=1.0) as g:
+        with ST.ActivationRecorder(m, [L]) as rec:
+            steered = m(**b).logits.clone()
+    assert g.n_applied == 1 and g.n_changed == 1
+    assert g.positions_source in ("cache_position", "position_ids")
+    p_after = float((rec.raw(L)[pos] - ax.mu) @ ax.unit)
+    assert abs(p_after - 2.0 * ax.sigma) < 1e-3, p_after
+    assert torch.allclose(clean[:, :pos], steered[:, :pos], atol=1e-5)
+    assert not torch.allclose(clean[:, pos:], steered[:, pos:])
+    # k = 4: проекция 3σ внутри полосы -> ничего не меняется.
+    with ST.drift_clamp(m, [ax], w, k=4.0, lam=1.0) as g2:
+        inside = _logits(m, b)
+    assert g2.n_applied == 1 and g2.n_changed == 0
+    assert torch.allclose(clean, inside, atol=1e-6)
+    # lam = 0 — no-op.
+    with ST.drift_clamp(m, [ax], w, k=2.0, lam=0.0) as g3:
+        zero = _logits(m, b)
+    assert g3.n_applied == 0 and torch.allclose(clean, zero, atol=1e-6)
+
+
+def test_projection_hook_several_layers(tiny_model):
+    _, m = tiny_model
+    b = _inputs(m)
+    pos = SEQ - 1
+    axes = [_axis_through(m, b, L, pos, 0.5) for L in (1, 2)]
+    with ST.drift_clamp(m, axes, PositionWindow(pos, pos + 1, "action_point"), 2.0, 1.0) as g:
+        _logits(m, b)
+    assert g.n_applied == 1 and len(g.hooks) == 2 and all(h.n_applied == 1 for h in g.hooks)
+
+
+def test_drift_axis_per_problem():
+    rng = np.random.default_rng(0)
+    d = rng.normal(size=16)
+    d /= np.linalg.norm(d)
+    ok = [rng.normal(size=16) * 0.1 + i for i in range(6)]          # сдвиг по задачам
+    fail = [a + 2 * d for a in ok]
+    groups = [f"t{i}" for i in range(6)]
+    ax, info = ST.drift_axis(fail, ok, groups, groups, layer=3)
+    assert info["mode"] == "per_problem" and info["n_problems"] == 6
+    assert float(ax.unit @ d) > 0.99, "ось = разность внутри задач, задачи не мешают"
+    ax2, info2 = ST.drift_axis(fail, ok, ["a"] * 6, ["b"] * 6, layer=3)
+    assert info2["mode"] == "global_means"
+    with pytest.raises(ValueError):
+        ST.drift_axis([], ok, [], groups, 3)

@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from ..steering import SteeringVector
+from ..steering import DriftAxis, SteeringVector
 from ..windows import PositionWindow
 
 
@@ -32,6 +32,27 @@ class ResolvedSteer:
 
 
 @dataclass
+class ResolvedTact:
+    """Адаптация TACT-Gate: оси дрейфа на нескольких слоях, окно, полоса k·sigma, сила lam."""
+
+    axes: list[DriftAxis]
+    window: PositionWindow
+    k: float
+    lam: float
+
+
+@dataclass
+class ResolvedAdapter:
+    """LoRA-адаптер: включается только на время решения, база не меняется."""
+
+    adapter_id: str
+    path: str
+
+
+Intervention = ResolvedSteer | ResolvedTact
+
+
+@dataclass
 class Decision:
     action: str
     scores: dict[str, float] | None = None     # scored: log-prob вызова каждого действия
@@ -42,6 +63,8 @@ class Decision:
     latency_ms: float = 0.0
     hook_applied: int | None = None
     positions_source: str | None = None
+    hook_changed: int | None = None            # TACT: сколько позиций реально сдвинуто
+    arguments: dict[str, Any] | None = None    # with_args=True: аргументы вызова от модели
 
 
 class Backend(Protocol):
@@ -55,14 +78,22 @@ class Backend(Protocol):
                tools: list[dict] | None, meta: dict[str, Any] | None = None,
                k_post: int = 4) -> Prompt: ...
 
-    def decide(self, prompt: Prompt, mode: str, steer: ResolvedSteer | None,
-               temperature: float, trial: int) -> Decision: ...
+    def decide(self, prompt: Prompt, mode: str, steer: Intervention | None,
+               temperature: float, trial: int, adapter: ResolvedAdapter | None = None,
+               with_args: bool = False, arg_tokens: int = 40) -> Decision: ...
 
-    def decide_restate(self, prompt: Prompt, mode: str, temperature: float,
-                       trial: int) -> Decision: ...
+    def decide_two_step(self, prompt: Prompt, ask: str, go: str, ask_tokens: int, mode: str,
+                        temperature: float, trial: int, adapter: ResolvedAdapter | None = None,
+                        with_args: bool = False, arg_tokens: int = 40) -> Decision: ...
 
     def record(self, prompt: Prompt, layers: list[int],
                windows: list[str]) -> dict[tuple[int, str], np.ndarray]: ...
+
+    def sft_example(self, prompt: Prompt, action: str,
+                    arguments: dict[str, Any]) -> tuple[list[int], list[int]]: ...
+
+    def train_adapter(self, examples: list[tuple[list[int], list[int]]], lora_cfg: Any,
+                      lr: float, epochs: int, out_dir: str) -> dict[str, Any]: ...
 
 
 def auto_layers(n_layers: int, k: int) -> list[int]:

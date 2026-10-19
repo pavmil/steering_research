@@ -16,6 +16,7 @@ from steering_tool_feedback import simulator as S
 from steering_tool_feedback.actions import parse_action
 from steering_tool_feedback.backends import MockBackend
 from steering_tool_feedback.config import ExperimentConfig, load_yaml
+from steering_tool_feedback.methods import get_method
 from steering_tool_feedback.pipeline import Experiment, StageOrderError, TestLockError
 
 REPO = Path(__file__).resolve().parents[1]
@@ -67,11 +68,14 @@ def test_config_rejects_bad(bad):
         ExperimentConfig.make("x", overrides=bad)
 
 
-def test_unknown_or_unimplemented_method_fails_early(root):
+def test_unknown_or_unimplemented_method_fails_early(root, monkeypatch):
+    from steering_tool_feedback import methods as MM
+
     with pytest.raises(KeyError):
         _exp(root, **{"eval.methods": ["baseline", "magic"]})
+    monkeypatch.setitem(MM.METHODS, "later", MM.MethodSpec("later", "baseline", implemented=False))
     with pytest.raises(NotImplementedError):
-        _exp(root, **{"eval.methods": ["baseline", "lora"]})
+        _exp(root, **{"eval.methods": ["baseline", "later"]})
 
 
 # --------------------------------------------------------------------------
@@ -95,7 +99,7 @@ def test_tasks_unique_and_no_leak_across_splits():
 def test_full_run_files_index_journal(root):
     exp = _exp(root)
     exp.run("test")
-    assert exp.done == ["data", "baseline", "probe", "vectors", "sweep", "freeze", "test"]
+    assert exp.done == ["data", "baseline", "probe", "vectors", "sweep", "fit", "freeze", "test"]
     for f in ("config.yaml", "manifest.json", "data.json", "probe.csv", "vectors.json",
               "sweep.csv", "selection.json", "test.json", "log.txt"):
         assert (exp.dir / f).exists(), f
@@ -122,12 +126,17 @@ def test_records_belong_to_their_own_tasks(root):
         assert sorted(ids) == sorted(want)
 
 
+ALL_METHODS = ["baseline", "strong_prompt", "restate", "explicit_state", "steering",
+               "steering_gated", "tact", "lora"]
+
+
 def test_cache_makes_rerun_free(root):
-    _exp(root).run("sweep")
+    """Повторный прогон до fit (вкл. эпизоды на val и «обучение» LoRA) — без вызовов модели."""
+    _exp(root, **{"eval.methods": ALL_METHODS}).run("fit")
     be = MockBackend()
-    exp2 = _exp(root, backend=be)
-    exp2.run("sweep")
-    assert be.calls == {"decide": 0, "record": 0}
+    exp2 = _exp(root, backend=be, **{"eval.methods": ALL_METHODS})
+    exp2.run("fit")
+    assert be.calls == {"decide": 0, "record": 0, "train": 0}
     assert exp2._dcache.hits > 0
 
 
@@ -187,7 +196,7 @@ def test_no_material_for_vectors_is_reported_not_crashed(root):
 
 def test_estimate(root):
     df = _exp(root).estimate()
-    assert list(df["stage"]) == ["baseline", "probe", "sweep", "test"]
+    assert list(df["stage"]) == ["baseline", "probe", "sweep", "fit", "test", "episodes"]
     assert (df["calls"] > 0).all()
 
 
@@ -301,12 +310,17 @@ def test_hf_pipeline_end_to_end(chatml_tokenizer, root):
         "eval.methods": ["baseline", "restate", "steering"]})
     exp.run("test")
     assert exp.done[-1] == "test"
-    recs = [json.loads(x) for f in (exp.dir / "decisions").glob("test__*.jsonl")
+    files = list((exp.dir / "decisions").glob("test__*.jsonl"))
+    recs = [json.loads(x) for f in files if "__episodes__" not in f.name
             for x in f.read_text().splitlines()]
     steered = [r for r in recs if r["method"].startswith(("steering", "sham")) and r["hook_applied"]]
     assert all(r["positions_source"] in ("cache_position", "position_ids") for r in steered)
     restate = [r for r in recs if r["method"] == "restate"]
     assert restate and all(r["n_model_calls"] >= 2 for r in restate)
+    eps = [json.loads(x) for f in files if "__episodes__" in f.name
+           for x in f.read_text().splitlines()]
+    assert eps and all(e["steps"] and "arguments" in e["steps"][0] for e in eps)
+    assert {e["method"] for e in eps} >= {"baseline", "restate"}
 
 
 # --------------------------------------------------------------------------
@@ -332,3 +346,175 @@ def test_notebooks_execute_on_mock(name, tmp_path, monkeypatch):
                             resources={"metadata": {"path": str(REPO / "notebooks")}}).execute()
     if name != "01_smoke_mock.ipynb":
         assert "прогон" in (tmp_path / "JOURNAL.md").read_text()
+
+
+# --------------------------------------------------------------------------
+# конкуренты: явное состояние, гейт, TACT, LoRA; эпизоды; H4/ALT
+# --------------------------------------------------------------------------
+
+
+def test_all_methods_full_run(root):
+    exp = _exp(root, **{"eval.methods": ALL_METHODS})
+    exp.run("test")
+    fitted = exp.state["fitted"]
+    assert set(fitted) == {"steering_gated", "tact", "lora"}
+    for m, f in fitted.items():
+        assert f["rows"], m
+    frozen = exp.state["frozen"]["methods"]
+    assert "steering" in frozen and set(frozen) - {"steering"}, "freeze_id покрывает весь набор"
+    res = exp.state["test"]
+    assert set(ALL_METHODS) <= set(res["methods"]) | {m for m in ALL_METHODS if m not in frozen
+                                                       and get_method(m).fitted}
+    assert {"baseline", "steering"} <= set(res["episodes"])
+    assert "steering_vs_explicit_state" in res["comparisons"]
+    v = exp.verdicts()
+    assert v["H4"].status != "not_run" and v["ALT"].status != "not_run"
+    md = exp.report()
+    assert "H4" in md and "ALT" in md and "episode" in md
+    ex = [json.loads(x) for x in (exp.dir / "decisions" / "test__explicit_state.jsonl").read_text().splitlines()]
+    assert all(r["n_model_calls"] >= 2 for r in ex)
+
+
+def test_fitted_methods_use_train_and_val_only(root):
+    exp = _exp(root, **{"eval.methods": ALL_METHODS})
+    exp.run("fit")
+    assert not list((exp.dir / "decisions").glob("test__*")), "test открыт до freeze"
+    # LoRA учится на меняющих парах train — тех же, что и вектор
+    n_changing_train = len(exp._tasks("train", ("changing",)))
+    lora = exp.state["fitted"]["lora"]["rows"][0]
+    assert lora["n_examples"] == 2 * n_changing_train
+    # гейт: решения собраны из кэша steering/базы, без новых вызовов модели
+    be = MockBackend()
+    exp2 = _exp(root, backend=be, **{"eval.methods": ALL_METHODS})
+    exp2.run("fit")
+    assert be.calls["decide"] == 0
+    gated = exp2.evaluate("steering_gated", "val", write=False,
+                          gate=exp2._gate_spec(exp2.state["fitted"]["steering_gated"]["rows"][0]))
+    assert all("gate_p" in r for r in gated) and {r["gate_on"] for r in gated} <= {True, False}
+
+
+def test_test_lock_flags_other_freeze_of_same_data(root):
+    _exp(root).run("test")
+    exp2 = _exp(root, **{"eval.methods": ALL_METHODS})
+    exp2.run("test")              # другой набор методов -> другой freeze_id -> не блокируется,
+    assert any("уже открывался под другим набором" in f for f in exp2.flags)   # но помечается
+
+
+def test_episodes_on_mock(root):
+    exp = _exp(root)
+    exp.data()
+    eps = exp.evaluate_episodes("baseline", "val", write=False)
+    tasks = exp._tasks("val", ("changing", "invariant"))
+    assert len(eps) == 2 * len(tasks)
+    assert all(e["steps"][0]["expected"] == sorted(next(t for t in tasks if t.task_id == e["task_id"])
+                                                    .branch(e["branch"]).allowed_actions) for e in eps)
+    s = exp.summarize_episodes(eps)
+    assert 0 <= s["success"] <= s["critical_ok"] <= 1
+    # первый шаг эпизода = одношаговое решение (тот же промпт, тот же кэш)
+    single = {(r["task_id"], r["branch"]): r["action"] for r in exp.evaluate("baseline", "val", write=False)}
+    assert all(e["steps"][0]["action"] == single[(e["task_id"], e["branch"])] for e in eps)
+
+
+def test_gates_h4_and_alt():
+    c = lambda d, lo, hi: {"mean_diff": d, "ci_low": lo, "ci_high": hi, "excludes_zero": lo > 0 or hi < 0}  # noqa: E731
+    assert G.h4(None, None).status == "not_run"
+    assert G.h4({"comparisons": {"steering_vs_lora": c(0.2, 0.1, 0.3)}}, None).status == "inconclusive"
+    assert G.h4({"comparisons": {"steering_vs_lora": c(0.0, -0.1, 0.1)}}, None).status == "against"
+    assert G.h4(None, {"steering_vs_lora": c(-0.2, -0.3, -0.1)}).preliminary
+    lat = {"steering": {"latency_p50_ms": 100}, "strong_prompt": {"latency_p50_ms": 100},
+           "explicit_state": {"latency_p50_ms": 400}}
+    win = {"steering_vs_strong_prompt": c(0.2, 0.1, 0.3), "steering_vs_explicit_state": c(0.2, 0.1, 0.3)}
+    assert G.alternatives({"comparisons": win}, None, lat).status == "support"
+    tie_cheap = {**win, "steering_vs_strong_prompt": c(0.0, -0.1, 0.1)}
+    assert G.alternatives({"comparisons": tie_cheap}, None, lat).status == "against"
+    tie_costly = {**win, "steering_vs_explicit_state": c(0.0, -0.1, 0.1)}
+    assert G.alternatives({"comparisons": tie_costly}, None, lat).status == "inconclusive"
+
+
+def test_gate_h3_requires_episode_gain():
+    ep = lambda d, lo, hi: {"steering": {"paired": {"mean_diff": d, "ci_low": lo, "ci_high": hi,  # noqa: E731
+                                                     "excludes_zero": lo > 0 or hi < 0}}}
+    r = _test_res(0.2, 0.1, 0.3)
+    assert G.h3({**r, "episodes": ep(0.2, 0.1, 0.3)}, None, 0.05).status == "support"
+    assert G.h3({**r, "episodes": ep(0.02, -0.05, 0.1)}, None, 0.05).status == "inconclusive"
+    assert G.h3({**r, "episodes": ep(-0.2, -0.3, -0.1)}, None, 0.05).status == "against"
+
+
+@pytest.mark.model
+def test_hf_lora_adapter_trains_and_leaves_base_intact(chatml_tokenizer, tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from conftest import make_tiny_llama
+    from steering_tool_feedback.backends import ResolvedAdapter
+    from steering_tool_feedback.backends.hf import HFBackend
+    from steering_tool_feedback.config import LoraCfg
+    from steering_tool_feedback.episodes import Env
+
+    prev = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)          # как в HFBackend.load: обучение должно включать градиенты само
+    try:
+        _lora_checks(chatml_tokenizer, tmp_path, S, HFBackend, LoraCfg, Env, ResolvedAdapter)
+    finally:
+        torch.set_grad_enabled(prev)
+
+
+def _lora_checks(chatml_tokenizer, tmp_path, S, HFBackend, LoraCfg, Env, ResolvedAdapter):
+    from conftest import make_tiny_llama
+
+    be = HFBackend(make_tiny_llama(vocab=len(chatml_tokenizer)), chatml_tokenizer, "tiny", "cpu")
+    tasks = [t for t in S.build_pilot_set(30, seed=0) if t.pair_type == "changing"][:6]
+    prompts, examples = [], []
+    for t in tasks:
+        for b in (0, 1):
+            p = be.prompt(t.prompt(b), t.essential_field(b), S.tools_schema())
+            gold = sorted(t.branch(b).allowed_actions)[0]
+            ex = be.sft_example(p, gold, Env(t, b).canonical_arguments(gold))
+            assert ex[0] == p.prepared.input_ids and ex[1], "вход SFT = ровно оцениваемый промпт"
+            prompts.append(p)
+            examples.append(ex)
+    before = be.decide(prompts[0], "scored", None, 0.0, 0).scores
+    cfg = LoraCfg(rank=4, lora_alpha=8, dropout=0.0, grad_accum=1)
+    info = be.train_adapter(examples, cfg, lr=5e-3, epochs=3, out_dir=str(tmp_path / "ad"))
+    assert info["epoch_losses"][-1] < info["epoch_losses"][0], info
+    assert info["n_trainable"] > 0
+    ad = ResolvedAdapter("a1", str(tmp_path / "ad"))
+    on = be.decide(prompts[0], "scored", None, 0.0, 0, adapter=ad).scores
+    off = be.decide(prompts[0], "scored", None, 0.0, 0).scores
+    assert max(abs(before[k] - off[k]) for k in before) < 1e-5, "после адаптера база должна остаться базой"
+    assert max(abs(before[k] - on[k]) for k in before) > 1e-3, "адаптер должен менять решение"
+    d = be.decide(prompts[0], "scored", None, 0.0, 0, adapter=ad, with_args=True, arg_tokens=6)
+    assert isinstance(d.arguments, dict) and d.n_model_calls > len(S.ACTIONS)
+
+
+@pytest.mark.model
+def test_hf_system_prefix_cache_and_batched_candidates(chatml_tokenizer, tiny_model):
+    """Оптимизации не меняют чисел: кэш системного хода + батч кандидатов = полные прогоны."""
+    pytest.importorskip("torch")
+    import numpy as np
+
+    from conftest import MODEL_FACTORIES
+    from steering_tool_feedback import steering as ST
+    from steering_tool_feedback.backends.base import ResolvedSteer
+    from steering_tool_feedback.backends.hf import HFBackend
+
+    name, _ = tiny_model
+    be = HFBackend(MODEL_FACTORIES[name](vocab=len(chatml_tokenizer)), chatml_tokenizer,
+                   f"tiny-{name}", "cpu")
+    t = next(x for x in S.build_pilot_set(40) if x.pair_type == "changing"
+             and x.critical_step_position == "late")
+    p = be.prompt(t.prompt(1), t.essential_field(1), S.tools_schema())
+    ids = p.prepared.input_ids
+    prefix = be._system_prefix(ids, p.messages, p.tools, None)
+    assert prefix[0] > 0, "системный ход должен кэшироваться"
+    vec = ST.SteeringVector(1, np.random.default_rng(0).normal(size=be.hidden_size).astype("float32"),
+                            "post_message", {})
+    for steer in (None, ResolvedSteer(vec, p.windows["post_message"], 2.0)):
+        ref, _ = be.score_actions(ids, steer, shared_prefix=False)
+        d = be.decide(p, "scored", steer, 0.0, 0)
+        assert max(abs(ref[k] - d.scores[k]) for k in ref) < 1e-4
+        if steer:
+            assert d.hook_applied == len(steer.window)
+        a, n1, _ = be._generate(ids, steer, 0.0, 0, max_new_tokens=5)
+        b, n2, _ = be._generate(ids, steer, 0.0, 0, max_new_tokens=5,
+                                prefix=be._system_prefix(ids, p.messages, p.tools, steer))
+        assert a == b and n1 == n2

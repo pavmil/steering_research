@@ -4,8 +4,9 @@
 менять план по смыслу полученного результата инструмента — и выгоднее ли это, чем
 промпт, явное ведение состояния и дообучение.
 
-**Статус:** постановка зафиксирована, инфраструктура экспериментов готова,
-прогонов на обученной модели ещё не было. История — в [docs/JOURNAL.md](docs/JOURNAL.md).
+**Статус:** постановка зафиксирована, инфраструктура готова: все методы сравнения
+(промпт, пересказ, явное состояние, steering, steering с гейтом, адаптация TACT, LoRA) и
+многошаговые эпизоды. История и результаты — в [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## Ядро проекта в одном абзаце
 
@@ -17,7 +18,9 @@
 ## Быстрый старт (Mac)
 
 ```bash
-python3 -m pip install -e ".[model,notebooks,dev]"
+uv venv --python 3.12 .venv      # системный python3 на macOS — 3.9, проекту нужен ≥ 3.10
+uv pip install --python .venv/bin/python -e ".[model,notebooks,dev,finetune]"
+source .venv/bin/activate
 stf-doctor                      # видит ли этот python torch/transformers и MPS
 pytest                          # ~1–2 мин, без модели и сети
 jupyter lab notebooks/
@@ -50,9 +53,12 @@ src/steering_tool_feedback/    код (устанавливаемый пакет
   config.py                    конфиг эксперимента
   pipeline.py                  стадии data → … → test, протокол, сводки
   backends/                    HF (CPU / MPS / CUDA) и mock
-  methods.py                   baseline, strong_prompt, restate, steering, sham-контроли
+  methods.py                   baseline, strong_prompt, restate, explicit_state, steering,
+                               steering_gated, tact, lora, sham-контроли
   gates.py  journal.py         вердикты H1–H4; журнал
   simulator.py  windows.py     парные миры; окна позиций
+  episodes.py                  многошаговая среда от точки решения пары, verifier
+  finetune.py                  LoRA/SFT на тех же данных (H4)
   steering.py  probe.py        хуки и векторы; probe
   metrics.py  actions.py       метрики; формат вызова и разбор действия
   store.py  viz.py             файлы и кэш; графики

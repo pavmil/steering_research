@@ -141,7 +141,8 @@ class Store:
     # --- сводная таблица ----------------------------------------------
     INDEX_FIELDS = ("run_id", "time", "name", "hypothesis", "model", "mode", "stages",
                     "base_success", "steer_success", "paired_diff", "ci", "spec_drop",
-                    "H1", "H2", "H3", "git", "dirty", "notebook")
+                    "episode_base", "episode_steer", "H1", "H2", "H3", "H4", "ALT",
+                    "git", "dirty", "notebook")
 
     def update_index(self, row: dict[str, Any]) -> None:
         path = self.results / "index.csv"
@@ -178,11 +179,21 @@ class Store:
         return [r for r in map(json.loads, path.read_text().splitlines())
                 if r.get("freeze_id") == freeze_id]
 
-    def record_test_opening(self, freeze_id: str, run_id: str, reason: str | None) -> None:
+    def test_openings_scope(self, scope: str) -> list[dict[str, Any]]:
+        """Все открытия test для той же модели и тех же данных (под любым freeze_id)."""
+        path = self.results / "test_lock.jsonl"
+        if not path.exists():
+            return []
+        return [r for r in map(json.loads, path.read_text().splitlines())
+                if r.get("scope") == scope]
+
+    def record_test_opening(self, freeze_id: str, run_id: str, reason: str | None,
+                            scope: str | None = None) -> None:
         with (self.results / "test_lock.jsonl").open("a") as f:
             f.write(json.dumps({"freeze_id": freeze_id, "run_id": run_id,
                                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                "reopen_reason": reason}, ensure_ascii=False) + "\n")
+                                "reopen_reason": reason, "scope": scope},
+                               ensure_ascii=False) + "\n")
 
 
 class DecisionCache:

@@ -27,9 +27,10 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
-Window = Literal["tool_content", "field_read", "post_message", "pre_action"]
+Window = Literal["tool_content", "field_read", "post_message", "pre_action", "action_point"]
 
-WINDOW_ORDER: tuple[Window, ...] = ("tool_content", "field_read", "post_message", "pre_action")
+WINDOW_ORDER: tuple[Window, ...] = ("tool_content", "field_read", "post_message", "pre_action",
+                                    "action_point")
 
 
 class WindowError(ValueError):
@@ -144,7 +145,10 @@ def prepare_prompt(
       tool_content — все токены текста ответа инструмента;
       field_read   — токены существенного поля;
       post_message — хвост ответа + закрывающая обёртка (</tool_response><|im_end|>…);
-      pre_action   — generation prompt: позиции прямо перед первым токеном действия.
+      pre_action   — generation prompt: позиции прямо перед первым токеном действия;
+      action_point — последний токен промпта: точка, где модель выбирает действие
+                     (аналог позиции </think> в TACT; у Qwen3 без рассуждения это
+                     токен сразу после пустого блока <think></think>).
 
     locate=False — только рендер и токены, без окон (для методов, где после
     ответа инструмента идут ещё сообщения и вмешательства нет).
@@ -226,6 +230,7 @@ def prepare_prompt(
     if g_lo >= len(ids):
         raise WindowError("empty generation prompt and no tokens after the tool content")
     windows["pre_action"] = PositionWindow(g_lo, len(ids), "pre_action")
+    windows["action_point"] = PositionWindow(len(ids) - 1, len(ids), "action_point")
 
     prepared = PreparedPrompt(
         text=full,
@@ -278,6 +283,9 @@ def validate_windows(p: PreparedPrompt) -> None:
         raise WindowError("post_message overlaps pre_action")
     if pa.end != n:
         raise WindowError("pre_action must end at the last prompt token")
+    ap = w.get("action_point")
+    if ap is not None and (len(ap) != 1 or ap.end != n):
+        raise WindowError("action_point must be exactly the last prompt token")
 
 
 # --------------------------------------------------------------------------

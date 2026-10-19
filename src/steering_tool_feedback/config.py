@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-WINDOW_KINDS = ("tool_content", "field_read", "post_message", "pre_action")
+WINDOW_KINDS = ("tool_content", "field_read", "post_message", "pre_action", "action_point")
 SHAMS = ("random_direction", "permuted_coords", "layer_shift", "window_shift")
 
 DEFAULT_STRONG_PROMPT = (
@@ -84,6 +84,53 @@ class SteerCfg:
 
 
 @dataclass
+class EpisodeCfg:
+    # Многошаговый эпизод от точки решения пары (episodes.py). Первое решение —
+    # то же, что в одношаговом протоколе; дальше среда исполняет действия агента.
+    enabled: bool = True
+    max_steps: int = 4                 # бюджет решений агента в эпизоде
+    arg_tokens: int = 40               # сколько токенов модель пишет на аргументы вызова
+    on_val: bool = True                # эпизоды и на val (картина до test), не только на test
+
+
+@dataclass
+class LoraCfg:
+    # LoRA/SFT на ТЕХ ЖЕ данных, что и вектор steering: меняющие пары train,
+    # обе ветки; цель — верный вызов. Гиперпараметры выбираются на val (grid).
+    rank: int = 8
+    lora_alpha: int = 16
+    dropout: float = 0.05
+    target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    grid: list[dict] = field(default_factory=lambda: [{"lr": 1e-4, "epochs": 2},
+                                                      {"lr": 3e-4, "epochs": 2}])
+    grad_accum: int = 4
+    train_dtype: str = "float32"       # обучение адаптера; оценка — в dtype модели
+    seed: int = 0
+
+
+@dataclass
+class GateCfg:
+    # Обучаемый гейт: логистическая регрессия на активациях в окне вмешательства
+    # предсказывает «база ошибётся». Обучается на train (меняющие + инвариантные
+    # пары), порог — на val. На входе только активации промпта: без oracle-метки,
+    # парной ветки и будущего.
+    thresholds: list[float] = field(default_factory=lambda: [0.3, 0.5, 0.7])
+    C: float = 0.1
+
+
+@dataclass
+class TactCfg:
+    # Адаптация TACT (2605.05980, TACT-Gate/Cap): ось «игнорирует ответ (overacting)
+    # vs верно» по train, вмешательство в точке действия на top-K слоях, только
+    # если проекция выходит из полосы k·σ откалиброванных шагов.
+    window: str = "action_point"
+    k: float = 2.0
+    lambdas: list[float] = field(default_factory=lambda: [0.5, 1.0, 1.5, 2.0])
+    layer_frac: float = 0.15           # TACT: 10 из 64 слоёв; у нас доля от n_layers
+    min_layers: int = 2
+
+
+@dataclass
 class EvalCfg:
     methods: list[str] = field(default_factory=lambda: ["baseline", "strong_prompt", "steering"])
     shams: list[str] = field(default_factory=lambda: list(SHAMS))
@@ -104,6 +151,10 @@ class ExperimentConfig:
     decision: DecisionCfg = field(default_factory=DecisionCfg)
     probe: ProbeCfg = field(default_factory=ProbeCfg)
     steer: SteerCfg = field(default_factory=SteerCfg)
+    episode: EpisodeCfg = field(default_factory=EpisodeCfg)
+    lora: LoraCfg = field(default_factory=LoraCfg)
+    gate: GateCfg = field(default_factory=GateCfg)
+    tact: TactCfg = field(default_factory=TactCfg)
     eval: EvalCfg = field(default_factory=EvalCfg)
 
     _DESCRIPTIVE = ("name", "hypothesis", "notes", "notebook")
@@ -167,6 +218,13 @@ class ExperimentConfig:
             raise ValueError("scored mode is deterministic: decision.n_trials must be 1")
         if self.decision.n_trials > 1 and self.decision.temperature <= 0:
             raise ValueError("n_trials > 1 needs temperature > 0, otherwise trials are identical")
+        if self.tact.window not in WINDOW_KINDS:
+            raise ValueError(f"unknown tact.window {self.tact.window!r}")
+        if self.episode.max_steps < 1:
+            raise ValueError("episode.max_steps must be >= 1")
+        for g in self.lora.grid:
+            if set(g) - {"lr", "epochs"} or not {"lr", "epochs"} <= set(g):
+                raise ValueError(f"lora.grid entries need exactly lr and epochs, got {g}")
 
     def save_yaml(self, path: str | Path) -> None:
         import yaml
@@ -188,7 +246,8 @@ def load_yaml(path: str | Path) -> ExperimentConfig:
 # --------------------------------------------------------------------------
 
 
-_SECTIONS = ("model", "data", "decision", "probe", "steer", "eval")
+_SECTIONS = ("model", "data", "decision", "probe", "steer", "episode", "lora", "gate", "tact",
+             "eval")
 
 
 def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:

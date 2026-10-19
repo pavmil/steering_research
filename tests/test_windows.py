@@ -145,3 +145,34 @@ def test_every_pilot_prompt_builds_on_real_template(real_tokenizer):
         for b in (0, 1):
             prepare_prompt(real_tokenizer, t.prompt(b), essential_field=t.essential_field(b),
                            tools=tools)
+
+
+# --------------------------------------------------------------------------
+# Скоринг: токены имени действия = каноническая токенизация вызова
+# --------------------------------------------------------------------------
+
+
+def _check_name_tokens(tok, kw):
+    from steering_tool_feedback.actions import detect_action_format, name_tokens
+
+    t = _changing_task()
+    msgs = t.prompt(1)
+    fmt = detect_action_format(tok, msgs, S.tools_schema(), kw)
+    pre, cands = name_tokens(tok, fmt, S.ACTIONS)
+    gen = tok.apply_chat_template(msgs, tools=S.tools_schema(), tokenize=False,
+                                  add_generation_prompt=True, **kw)
+    for a, c in cands.items():
+        full = tok.apply_chat_template(msgs + [S.tool_call_message(a, {})], tools=S.tools_schema(),
+                                       tokenize=False, add_generation_prompt=False, **kw)
+        canon = tok(full[len(gen):], add_special_tokens=False)["input_ids"]
+        assert canon[:len(pre) + len(c)] == pre + c, f"{a}: scored tokens are not what the model writes"
+        assert a in tok.decode(c), a
+
+
+def test_scored_tokens_are_canonical_chatml(chatml_tokenizer):
+    _check_name_tokens(chatml_tokenizer, {})
+
+
+def test_scored_tokens_are_canonical_real(real_tokenizer):
+    """Регрессия (Qwen3-1.7B): отдельный токен `"` после имени стоил ~−37 nats."""
+    _check_name_tokens(real_tokenizer, {"enable_thinking": False})

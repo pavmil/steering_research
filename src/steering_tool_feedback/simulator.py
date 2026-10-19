@@ -221,7 +221,7 @@ _TOOL_DESCRIPTIONS = {
     "verify_source": ("Re-verify a tool result with an independent source.", {"item": "string"}),
     "retry_call": ("Retry the previous tool call.", {}),
     "stop_no_option": ("Stop: no acceptable option exists.", {"reason": "string"}),
-    "proceed": ("Proceed with the user's request using the fetched data.", {}),
+    "proceed": ("Finish the request: answer the user using the data already fetched.", {}),
 }
 
 

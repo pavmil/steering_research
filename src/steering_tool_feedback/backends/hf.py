@@ -3,6 +3,7 @@
 Mac (MPS):
   * dtype по умолчанию float16; PYTORCH_ENABLE_MPS_FALLBACK=1 ставится до
     импорта torch — редкие операции без MPS-ядра уйдут на CPU, а не упадут;
+  * HF_DEACTIVATE_ASYNC_LOAD=1 — веса грузятся в одном потоке (см. ниже, зачем);
   * гибридные модели с линейным вниманием (Qwen3.5/3.6) на MPS идут через
     медленную референсную реализацию — для пилота лучше обычные 1–3B модели;
   * логиты всегда только по нужным позициям (logits_to_keep): у словарей
@@ -31,6 +32,10 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+# Параллельная загрузка весов (пул потоков transformers 5) взаимно блокируется внутри
+# safetensors при подключении LoRA-адаптера: один поток ждёт GIL в OnceCell, другой держит
+# GIL и ждёт тот же OnceCell (зависание на 30+ мин, 04 на Qwen3-1.7B, 2026-10-19).
+os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
 import numpy as np  # noqa: E402
 

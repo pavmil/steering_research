@@ -1068,10 +1068,13 @@ class Experiment:
         if "data" not in self.done:
             self.data()
         tasks = self._tasks("train", ("changing",))[:n_samples]
+        # Загрузка модели, построение промптов и прогрев (кэш системного хода) — вне замера.
+        prompts = [self._prompt(t, 0) for t in tasks]
+        self.backend.decide(self._prompt(tasks[0], 1), self.cfg.decision.mode, None,
+                            self.cfg.decision.temperature, 0)
         t0 = time.perf_counter()
-        for t in tasks:
-            self.backend.decide(self._prompt(t, 0), self.cfg.decision.mode, None,
-                                self.cfg.decision.temperature, 0)
+        for p in prompts:
+            self.backend.decide(p, self.cfg.decision.mode, None, self.cfg.decision.temperature, 0)
         per_decision = (time.perf_counter() - t0) / max(1, len(tasks))
         t0 = time.perf_counter()
         self.backend.decide(self._prompt(tasks[0], 1), self.cfg.decision.mode, None,

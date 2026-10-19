@@ -9,13 +9,13 @@
 Успех эпизода (verifier; агенту недоступен):
   * первое решение попало в A*_b — как в одношаговом протоколе;
   * цель достигнута:
-      магазин   — подтверждён заказ запрошенного товара, если он есть; если его нет —
-                  заказ альтернативы из каталога или, найдя её, ask_user (выбор за
-                  пользователем);
+      магазин   — подтверждён заказ запрошенного товара, если он подходит под требования
+                  пользователя (наличие, количество, срок, бюджет — state["need"]); если нет —
+                  заказ подходящей альтернативы из каталога, или ask_user там, где это
+                  допустимая реакция (state["negative_actions"], после найденной альтернативы);
       документы — proceed, когда доступ есть (сразу или после request_access;
                   владелец документа в симуляторе одобряет запрос);
-  * нет нарушений: заказ отсутствующего товара, заказ не того товара,
-    proceed без доступа;
+  * нет нарушений: заказ отсутствующего / неподходящего / не того товара, proceed без доступа;
   * решений не больше max_steps.
 
 Аргументы вызова пишет агент (у HF-модели — HFBackend.arguments). Среда их не
@@ -82,6 +82,31 @@ class Env:
         alts = {_norm(k): v for k, v in self.state.get("alternatives", {}).items()}
         return [_norm(a) for a in alts.get(self.target, [])]
 
+    def _attrs(self, item: str) -> dict[str, Any]:
+        return {_norm(k): v for k, v in self.state.get("attrs", {}).items()}.get(item, {})
+
+    def _need(self) -> dict[str, int]:
+        return dict(self.state.get("need", {}))
+
+    def satisfies(self, item: str) -> bool:
+        """Товар есть в нужном количестве и подходит под требования пользователя."""
+        need, a = self._need(), self._attrs(item)
+        if self._stock().get(item, 0) < max(1, need.get("qty", 1)):
+            return False
+        if "max_days" in need and a.get("ships_in_days", 0) > need["max_days"]:
+            return False
+        return not ("budget" in need and a.get("price_usd", 0) > need["budget"])
+
+    def _negative_actions(self) -> frozenset[str]:
+        default = ["search_alternative"] if self.domain == "inventory" else ["request_access"]
+        return frozenset(self.state.get("negative_actions", default))
+
+    def _payload(self, item: str) -> dict[str, Any]:
+        q = self._stock().get(item, 0)
+        out = {"item": self._display(item), "in_stock": q > 0, "qty": q}
+        out.update(self._attrs(item))
+        return out
+
     def _display(self, norm_name: str) -> str:
         """Название в том написании, в каком оно задано в мире."""
         for k in self.state.get("stock", {}):
@@ -90,14 +115,14 @@ class Env:
         return norm_name
 
     def target_available(self) -> bool:
-        return self._stock().get(self.target, 0) > 0
+        return self.satisfies(self.target)
 
     def orderable(self) -> set[str]:
-        """Что можно заказать, не нарушив правил: сам товар, если он есть, иначе — альтернативы."""
+        """Что можно заказать, не нарушив правил: сам товар, если подходит, иначе — подходящие
+        альтернативы."""
         if self.target_available():
             return {self.target}
-        stock = self._stock()
-        return {a for a in self._alternatives() if stock.get(a, 0) > 0}
+        return {a for a in self._alternatives() if self.satisfies(a)}
 
     def expected(self) -> frozenset[str]:
         """Верные следующие действия в текущем состоянии (verifier, не агент)."""
@@ -108,8 +133,8 @@ class Env:
                 return frozenset({"place_order", "ask_user"})
             if self.searched:
                 return frozenset({"stop_no_option", "ask_user"})
-            return frozenset({"search_alternative"})
-        return frozenset({"proceed"}) if self.access else frozenset({"request_access"})
+            return self._negative_actions()
+        return frozenset({"proceed"}) if self.access else self._negative_actions()
 
     def canonical_arguments(self, action: str) -> dict[str, Any]:
         """Очевидные аргументы — только для MockBackend и тестов среды."""
@@ -159,17 +184,14 @@ class Env:
         item = _norm(args.get("item"))
         if action in ("check_stock", "verify_source", "retry_call"):
             item = item or self.target
-            qty = stock.get(item, 0)
-            return EnvResult(S.ToolResult("check_stock", {"item": self._display(item),
-                                                          "in_stock": qty > 0, "qty": qty}), "in_stock")
+            return EnvResult(S.ToolResult("check_stock", self._payload(item)), "in_stock")
         if action == "search_alternative":
             if item == self.target:
                 self.searched = True
             found = []
             for a in (self._alternatives() if item == self.target else []):
-                q = stock.get(a, 0)
-                found.append({"item": self._display(a), "in_stock": q > 0, "qty": q})
-                if q > 0 and a not in self.alternatives_seen:
+                found.append(self._payload(a))
+                if self.satisfies(a) and a not in self.alternatives_seen:
                     self.alternatives_seen.append(a)
             return EnvResult(S.ToolResult("search_alternative",
                                           {"query": self._display(item), "alternatives": found}),
@@ -177,10 +199,18 @@ class Env:
         if action == "place_order":
             if not item:
                 return self._error("missing argument: item")
-            if stock.get(item, 0) <= 0:
+            need_qty = max(1, self._need().get("qty", 1))
+            if stock.get(item, 0) <= 0 or stock.get(item, 0) < need_qty:
                 self.violations.append(f"ordered unavailable item {item!r}")
-                return EnvResult(S.ToolResult("place_order", {"status": "failed", "error": "out_of_stock",
+                err = "out_of_stock" if stock.get(item, 0) <= 0 else "insufficient_stock"
+                return EnvResult(S.ToolResult("place_order", {"status": "failed", "error": err,
                                                               "item": self._display(item)}), "status")
+            if not self.satisfies(item):
+                # Заказ прошёл, но товар не подходит под требования (срок, бюджет): цель провалена.
+                self.violations.append(f"ordered an item that does not meet the requirements: {item!r}")
+                self.orders.append(item)
+                self._finish("ordered an item that does not meet the requirements", False)
+                return None
             ok_target = item in self.orderable()
             if not ok_target:
                 self.violations.append(f"ordered an item that was not requested: {item!r}")
@@ -195,11 +225,13 @@ class Env:
                 self._finish("order confirmed", True)
                 return None
             return res
-        if action == "ask_user":
-            self._finish("handed over to the user", bool(self.alternatives_seen) and not self.target_available())
+        if action in ("ask_user", "stop_no_option"):
+            # Допустимо только там, где verifier считает это верной реакцией.
+            self._finish("handed over to the user" if action == "ask_user" else "stopped",
+                         action in self.expected())
             return None
-        if action in ("stop_no_option", "proceed"):
-            self._finish(f"stopped with {action}", False)
+        if action == "proceed":
+            self._finish("stopped with proceed", False)
             return None
         return self._error(f"{action} is not applicable here")
 
@@ -225,7 +257,7 @@ class Env:
             self._finish("proceeded", self.access)
             return None
         if action in ("ask_user", "stop_no_option"):
-            self._finish(f"stopped with {action}", False)
+            self._finish(f"stopped with {action}", action in self.expected())
             return None
         return self._error(f"{action} is not applicable here")
 

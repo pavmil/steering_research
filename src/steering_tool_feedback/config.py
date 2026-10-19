@@ -47,6 +47,7 @@ class ModelCfg:
 
 @dataclass
 class DataCfg:
+    generator: str = "v3"              # v2 — явный смысл ответа; v3 — смысл относительно цели
     n_tasks: int = 120
     seed: int = 0
     split: tuple[float, float, float] = (0.5, 0.2, 0.3)
@@ -218,6 +219,8 @@ class ExperimentConfig:
             raise ValueError("scored mode is deterministic: decision.n_trials must be 1")
         if self.decision.n_trials > 1 and self.decision.temperature <= 0:
             raise ValueError("n_trials > 1 needs temperature > 0, otherwise trials are identical")
+        if self.data.generator not in ("v2", "v3"):
+            raise ValueError("data.generator must be 'v2' or 'v3'")
         if self.tact.window not in WINDOW_KINDS:
             raise ValueError(f"unknown tact.window {self.tact.window!r}")
         if self.episode.max_steps < 1:

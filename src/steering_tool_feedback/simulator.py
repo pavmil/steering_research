@@ -532,13 +532,8 @@ def signature(t: PairedTask) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
-GENERATOR_VERSION = "v2"   # v2: поздняя позиция с настоящей историей, каталог альтернатив
-
-
-def build_pilot_set(
-    n_tasks: int = 120, seed: int = 0
-) -> list[PairedTask]:
-    """Пилотный набор на 100-200 задач (docs/EXPERIMENT_PLAN.md, этап 1).
+def _build_v2(n_tasks: int, seed: int) -> list[PairedTask]:
+    """v2: явный смысл ответа (в наличии / нет, доступ есть / нет).
 
     Состав намеренно смещён в сторону changing-пар, но инвариантных должно быть
     достаточно, чтобы specificity имела смысл. Стресс-пары малочисленны —
@@ -590,6 +585,278 @@ def build_pilot_set(
         seen.add(sig)
         tasks.append(t)
     return tasks
+
+
+
+# --------------------------------------------------------------------------
+# Генератор v3: смысл ответа относительно цели пользователя
+# --------------------------------------------------------------------------
+#
+# Почему v3 (docs/JOURNAL.md, 2026-10-19): на v2 Qwen3-1.7B почти без ошибок реагирует
+# на явный смысл («in_stock: false»), а все её ошибки — артефакты постановки. В v3 ответ
+# инструмента содержит все поля (наличие, количество, срок, цена), и что из них важно —
+# решает запрос пользователя: «в наличии», но придёт позже срока / меньше нужного /
+# дороже бюджета — заказывать нельзя. Ключевое слово «in_stock: true» тянет к ошибке.
+#
+# Исправлено против v2:
+#   * в явной инструкции нет имени инструмента («proceed with the order» -> place);
+#   * A* «плохой» ветки зависит от явности условия: если инструкция предписывает
+#     искать альтернативу / запросить доступ — только это; если не предписывает —
+#     ask_user тоже разумная реакция (в v2 он считался ошибкой);
+#   * инвариантные пары обеих полярностей (в v2 все были «нет в наличии» — вмешательство,
+#     толкающее к альтернативе, не теряло бы специфичность) и трёх видов из HYPOTHESES:
+#     другая форма, другая длина, нерелевантное поле.
+
+_V3_SHOP_EXPLICIT = (
+    "You are a shopping assistant. Call tools to complete the user's order. After each tool "
+    "result, check it against the user's request: if the item is unavailable or does not meet "
+    "the user's requirements (quantity, delivery time, budget), search for an alternative "
+    "instead of ordering; if it meets them, place the order."
+)
+_NEEDS = ("none", "deadline", "quantity", "budget")
+_NEED_KEY = {"none": "in_stock", "deadline": "ships_in_days", "quantity": "qty", "budget": "price_usd"}
+_NEED_REQ = {
+    "none": ["Please order a {item}.", "Can you buy me a {item}?",
+             "I need a {item} - order one, please.", "Add a {item} to my order."],
+    "deadline": ["Please order a {item}. I need it within {days} days.",
+                 "Order a {item} for me - it has to arrive in {days} days or less.",
+                 "Can you get me a {item}? It must be here within {days} days."],
+    "quantity": ["Please order {qty} units of {item}.", "I need {qty} of the {item} - order them, please.",
+                 "Order {qty} x {item} for the team."],
+    "budget": ["Please order a {item}, my budget is ${budget}.", "Buy a {item} if it costs at most ${budget}.",
+               "Get me a {item} - I can spend up to ${budget}."],
+}
+_NEED_MULTI = {
+    "none": ["Please order a {other} and a {item}.", "Can you buy me a {other} and a {item}?"],
+    "deadline": ["Please order a {other} and a {item}. I need both within {days} days.",
+                 "Order a {other} and a {item} - both have to arrive in {days} days or less."],
+    "quantity": ["Please order {qty} units each of {other} and {item}.",
+                 "I need {qty} of the {other} and {qty} of the {item}."],
+    "budget": ["Please order a {other} and a {item}, at most ${budget} each.",
+               "Buy a {other} and a {item}; I can spend up to ${budget} on each."],
+}
+
+
+def _attrs_payload(item: str, qty: int, ships: int, price: int) -> dict[str, Any]:
+    return {"item": item, "in_stock": qty > 0, "qty": qty, "ships_in_days": ships, "price_usd": price}
+
+
+def _meets(need: dict[str, int], qty: int, ships: int, price: int) -> bool:
+    return (qty >= need.get("qty", 1) and ships <= need.get("max_days", 10 ** 6)
+            and price <= need.get("budget", 10 ** 6))
+
+
+class _V3Rng:
+    """Значения полей, которые выполняют / нарушают требование пользователя."""
+
+    def __init__(self, rng: random.Random):
+        self.r = rng
+
+    def need(self, kind: str) -> dict[str, int]:
+        r = self.r
+        if kind == "deadline":
+            return {"max_days": r.randint(2, 7)}
+        if kind == "quantity":
+            return {"qty": r.randint(3, 8)}
+        if kind == "budget":
+            return {"budget": r.choice([20, 25, 30, 40, 50, 60, 80])}
+        return {}
+
+    def fields(self, kind: str, need: dict[str, int], ok: bool) -> tuple[int, int, int]:
+        """(qty, ships_in_days, price_usd), удовлетворяющие need (ok) или нарушающие его."""
+        r = self.r
+        qty, ships, price = r.randint(3, 25), r.randint(1, 14), r.randint(8, 120)
+        if kind == "none":
+            qty = qty if ok else 0
+        if kind == "deadline":
+            n = need["max_days"]
+            ships = r.randint(1, n) if ok else n + r.randint(2, 20)
+        if kind == "quantity":
+            k = need["qty"]
+            qty = k + r.randint(0, 20) if ok else r.randint(1, k - 1)
+        if kind == "budget":
+            b = need["budget"]
+            price = r.randint(max(1, b // 3), b) if ok else b + r.randint(5, 60)
+        if kind != "deadline" and "max_days" in need:
+            ships = min(ships, need["max_days"])
+        if kind != "budget" and "budget" in need:
+            price = min(price, need["budget"])
+        return qty, ships, price
+
+
+def _v3_world(wid: str, item: str, f: tuple[int, int, int], kind: str, need: dict[str, int],
+              alts: list[tuple[str, tuple[int, int, int]]], ok: bool, neg_actions: list[str],
+              style: str = "json") -> World:
+    stock = {item: f[0], **{a: af[0] for a, af in alts}}
+    attrs = {item: {"ships_in_days": f[1], "price_usd": f[2]},
+             **{a: {"ships_in_days": af[1], "price_usd": af[2]} for a, af in alts}}
+    return World(
+        world_id=wid,
+        state={"stock": stock, "attrs": attrs, "alternatives": {item: [a for a, _ in alts]},
+               "need": dict(need), "negative": not ok, "negative_actions": list(neg_actions)},
+        result=ToolResult("check_stock", _attrs_payload(item, *f)),
+        allowed_actions=frozenset({"place_order"}) if ok else frozenset(neg_actions),
+        essential_key=_NEED_KEY[kind],
+        render_style=style,
+    )
+
+
+def _v3_alternatives(g: _V3Rng, item: str, kind: str, need: dict[str, int]) -> list:
+    """Каталог альтернатив: всегда одна подходящая; иногда первой идёт неподходящая."""
+    r = g.r
+    pre = r.sample(_ALT_PREFIXES, 2)
+    alts = [(f"{pre[0]} {item}", g.fields(kind, need, True))]
+    if r.random() < 0.5:
+        alts.insert(0, (f"{pre[1]} {item}", g.fields(kind if kind != "none" else "none", need, False)))
+    return alts
+
+
+def _v3_history(kind: str, need: dict[str, int], item: str, other: str | None, late: bool,
+                g: _V3Rng) -> list[dict[str, Any]]:
+    fmt = {"item": item, "other": other, "days": need.get("max_days"), "qty": need.get("qty"),
+           "budget": need.get("budget")}
+    if not late:
+        return [{"role": "user", "content": g.r.choice(_NEED_REQ[kind]).format(**fmt)}]
+    of = g.fields(kind, need, True)
+    return [
+        {"role": "user", "content": g.r.choice(_NEED_MULTI[kind]).format(**fmt)},
+        tool_call_message("check_stock", {"item": other}),
+        tool_message(ToolResult("check_stock", _attrs_payload(other, *of))),
+        tool_call_message("place_order", {"item": other}),
+        tool_message(ToolResult("place_order", {"status": "confirmed",
+                                                "order_id": _order_id(other, *of), "item": other})),
+    ]
+
+
+def _v3_shop_changing(tid: str, g: _V3Rng, kind: str, explicit: bool, late: bool) -> PairedTask:
+    r = g.r
+    item = r.choice(_ITEMS)
+    other = r.choice([x for x in _ITEMS if x != item])
+    need = g.need(kind)
+    neg = ["search_alternative"] if explicit else ["ask_user", "search_alternative"]
+    alts = _v3_alternatives(g, item, kind, need)
+    f_ok, f_bad = g.fields(kind, need, True), g.fields(kind, need, False)
+    return PairedTask(
+        task_id=tid, pair_type="changing",
+        instruction=_V3_SHOP_EXPLICIT if explicit else _BASE_INSTRUCTION_IMPLICIT,
+        history=_v3_history(kind, need, item, other, late, g),
+        tool_call={"tool": "check_stock", "arguments": {"item": item}},
+        world_0=_v3_world(f"{tid}/meets", item, f_ok, kind, need, alts, True, neg),
+        world_1=_v3_world(f"{tid}/fails", item, f_bad, kind, need, alts, False, neg),
+        condition_explicit=explicit, critical_step_position="late" if late else "early",
+        notes=f"v3 need={kind}",
+    )
+
+
+def _v3_shop_invariant(tid: str, g: _V3Rng, kind: str, explicit: bool, late: bool,
+                       variant: str) -> PairedTask:
+    """variant: form — та же полезная нагрузка, другая форма (развёрнутый JSON / проза);
+    irrelevant — меняется поле, не важное для этого запроса (срок без дедлайна и т. п.)."""
+    r = g.r
+    item = r.choice(_ITEMS)
+    other = r.choice([x for x in _ITEMS if x != item])
+    need = g.need(kind)
+    ok = r.random() < 0.5
+    neg = ["search_alternative"] if explicit else ["ask_user", "search_alternative"]
+    alts = _v3_alternatives(g, item, kind, need)
+    f0 = g.fields(kind, need, ok)
+    if variant == "form":
+        f1, styles = f0, ("json", r.choice(["verbose_json", "prose"]))
+    else:
+        q, s_, p_ = f0
+        for _ in range(50):          # меняем только то, что этот запрос не ограничивает
+            q2 = q if kind in ("none", "quantity") else r.randint(max(1, need.get("qty", 1)), 25)
+            if kind == "none" and q > 0:
+                q2 = r.randint(1, 25)
+            s2 = s_ if kind == "deadline" else r.randint(1, need.get("max_days", 30))
+            p2 = p_ if kind == "budget" else r.randint(8, need.get("budget", 120))
+            if (q2, s2, p2) != f0 and _meets(need, q2, s2, p2) == _meets(need, *f0):
+                break
+        f1, styles = (q2, s2, p2), ("json", "json")
+        if f1 == f0 or _meets(need, *f1) != _meets(need, *f0):
+            f1, styles = f0, ("json", "verbose_json")
+    return PairedTask(
+        task_id=tid, pair_type="invariant",
+        instruction=_V3_SHOP_EXPLICIT if explicit else _BASE_INSTRUCTION_IMPLICIT,
+        history=_v3_history(kind, need, item, other, late, g),
+        tool_call={"tool": "check_stock", "arguments": {"item": item}},
+        world_0=_v3_world(f"{tid}/a", item, f0, kind, need, alts, ok, neg, styles[0]),
+        world_1=_v3_world(f"{tid}/b", item, f1, kind, need, alts, ok, neg, styles[1]),
+        condition_explicit=explicit, critical_step_position="late" if late else "early",
+        notes=f"v3 invariant={variant} need={kind} {'meets' if ok else 'fails'}",
+    )
+
+
+def _v3_access(tid: str, g: _V3Rng, explicit: bool, late: bool) -> PairedTask:
+    r = g.r
+    doc, other = (f"DOC-{x}" for x in r.sample(range(100, 1000), 2))
+    t = _access_pair(tid, doc, explicit, "late" if late else "early",
+                     r.choice(_MULTI_DOC_REQUESTS if late else _DOC_REQUESTS), r.choice(_DOC_CONTENT),
+                     other=other, other_content=r.choice(_DOC_CONTENT))
+    neg = ["request_access"] if explicit else ["ask_user", "request_access"]
+    for w in (t.world_0, t.world_1):
+        w.state.update(negative=w is t.world_1, negative_actions=list(neg))
+    t.world_1.allowed_actions = frozenset(neg)
+    t.validate()
+    return t
+
+
+def _build_v3(n_tasks: int, seed: int) -> list[PairedTask]:
+    """v3: смысл ответа относительно цели пользователя (см. комментарий выше)."""
+    rng = random.Random(seed)
+    g = _V3Rng(rng)
+    tasks: list[PairedTask] = []
+    seen: set[str] = set()
+    i = attempts = 0
+    while len(tasks) < n_tasks:
+        attempts += 1
+        if attempts > n_tasks * 50:
+            raise ValueError(f"cannot generate {n_tasks} distinct tasks; add templates")
+        i += 1
+        tid = f"t{i:04d}"
+        r = rng.random()
+        explicit = rng.random() < 0.5
+        late = rng.random() >= 0.7
+        if r < 0.14:
+            t = _v3_shop_changing(tid, g, "none", explicit, late)
+        elif r < 0.34:
+            t = _v3_shop_changing(tid, g, "deadline", explicit, late)
+        elif r < 0.46:
+            t = _v3_shop_changing(tid, g, "quantity", explicit, late)
+        elif r < 0.54:
+            t = _v3_shop_changing(tid, g, "budget", explicit, late)
+        elif r < 0.64:
+            t = _v3_access(tid, g, explicit, late)
+        elif r < 0.94:
+            t = _v3_shop_invariant(tid, g, rng.choice(_NEEDS), explicit, late,
+                                   "form" if r < 0.79 else "irrelevant")
+        else:
+            t = _stress_pair(tid, rng.choice(_ITEMS), rng.choice(_REQUESTS))
+            t.instruction = _V3_SHOP_EXPLICIT       # без имени инструмента в инструкции
+        sig = signature(t)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        tasks.append(t)
+    return tasks
+
+
+GENERATOR_VERSION = "v3"
+GENERATORS = {"v2": _build_v2, "v3": _build_v3}
+
+
+def build_pilot_set(n_tasks: int = 120, seed: int = 0,
+                    version: str = GENERATOR_VERSION) -> list[PairedTask]:
+    """Пилотный набор на 100-200 задач (docs/EXPERIMENT_PLAN.md, этап 1).
+
+    version — генератор (v2 — явный смысл ответа; v3 — смысл относительно цели).
+    Задачи с одинаковым содержимым (signature) отбрасываются: одинаковый промпт в train
+    и test — утечка. Состав смещён к меняющим парам; стресс-пары малочисленны и в главный
+    вывод не входят.
+    """
+    if version not in GENERATORS:
+        raise ValueError(f"unknown generator {version!r}; choose from {sorted(GENERATORS)}")
+    return GENERATORS[version](n_tasks, seed)
 
 
 # --------------------------------------------------------------------------
@@ -692,8 +959,10 @@ def audit(tasks: list[PairedTask]) -> AuditReport:
 
 
 def semantic_state(world: World) -> int:
-    """Смысл ответа в метках probe: 1 — «нет» (товара нет, доступ запрещён), 0 — «да».
-    Совпадает с номером ветки меняющих пар; для инвариантных пар — их общее состояние."""
+    """Смысл ответа в метках probe: 1 — «нет» (товара нет / не подходит, доступ запрещён),
+    0 — «да». Совпадает с номером ветки меняющих пар; для инвариантных — их общее состояние."""
+    if "negative" in world.state:
+        return int(bool(world.state["negative"]))
     p = world.result.payload
     if "in_stock" in p:
         return 0 if p["in_stock"] else 1

@@ -153,7 +153,7 @@ class Experiment:
         cur = json.loads(path.read_text()) if path.exists() else {}
         cur.update({"run_id": self.run_id, "name": self.cfg.name, "hypothesis": self.cfg.hypothesis,
                     "notebook": self.cfg.notebook, "config_hash": self.cfg.hash(),
-                    "generator": S.GENERATOR_VERSION,
+                    "generator": self.cfg.data.generator,
                     "git": self.git, "env": env_info(), "protocol": self.protocol,
                     "stages": self.done, "flags": self.flags})
         if backend is not None:
@@ -469,7 +469,7 @@ class Experiment:
     # ------------------------------------------------------------------
     def data(self) -> dict[str, Any]:
         c = self.cfg.data
-        tasks = S.build_pilot_set(c.n_tasks, seed=c.seed)
+        tasks = S.build_pilot_set(c.n_tasks, seed=c.seed, version=c.generator)
         rep = S.audit(tasks)
         if not rep.ok:
             raise ValueError(f"аудит данных не пройден:\n{rep}")
@@ -479,7 +479,7 @@ class Experiment:
         for t in tasks:
             by_pos[t.critical_step_position] += 1
         summary = {"n_tasks": len(tasks), "by_type": rep.by_pair_type, "by_domain": rep.by_domain,
-                   "by_position": dict(by_pos), "generator": S.GENERATOR_VERSION,
+                   "by_position": dict(by_pos), "generator": c.generator,
                    "splits": {k: len(v) for k, v in splits.items()},
                    "data_hash": sha([[t.task_id, t.history, t.world_0.observation(),
                                       t.world_1.observation()] for t in tasks])}

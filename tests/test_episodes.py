@@ -11,9 +11,9 @@ from steering_tool_feedback import episodes as E
 from steering_tool_feedback import simulator as S
 
 
-@pytest.fixture(scope="module")
-def tasks():
-    return [t for t in S.build_pilot_set(160, seed=0) if t.pair_type != "stress"]
+@pytest.fixture(scope="module", params=["v2", "v3"])
+def tasks(request):
+    return [t for t in S.build_pilot_set(160, seed=0, version=request.param) if t.pair_type != "stress"]
 
 
 def _agent(policy):
@@ -58,13 +58,14 @@ def test_first_step_equals_paired_decision(tasks):
 
 def test_ignoring_the_result_fails_with_violation(tasks):
     """Агент, который продолжает план по инерции, проваливает «плохую» ветку."""
-    shop = next(t for t in tasks if t.pair_type == "changing" and t.domain == "inventory")
+    shops = [t for t in tasks if t.pair_type == "changing" and t.domain == "inventory"]
     always_order = _agent(lambda exp, i, m: "place_order")
-    good = E.rollout(shop, 0, shop.prompt(0), always_order(shop, 0))
-    bad = E.rollout(shop, 1, shop.prompt(1), always_order(shop, 1))
-    assert good.success
-    assert not bad.success and not bad.critical_ok
-    assert any("unavailable" in v for v in bad.violations)
+    for shop in shops:
+        good = E.rollout(shop, 0, shop.prompt(0), always_order(shop, 0))
+        bad = E.rollout(shop, 1, shop.prompt(1), always_order(shop, 1))
+        assert good.success
+        assert not bad.success and not bad.critical_ok
+        assert any(("unavailable" in v or "does not meet" in v) for v in bad.violations), bad.violations
 
     doc = next(t for t in tasks if t.domain == "documents")
     always_go = _agent(lambda exp, i, m: "proceed")
@@ -80,19 +81,20 @@ def test_continuation_must_read_the_second_result(tasks):
     item = t.tool_call["arguments"]["item"]
     res = env.step("search_alternative", {"item": item})
     alts = res.result.payload["alternatives"]
-    assert alts and all(a["in_stock"] for a in alts)
+    good_alts = [a["item"] for a in alts if env.satisfies(a["item"].lower())]
+    assert alts and good_alts
     assert env.expected() == {"place_order", "ask_user"}
     env.step("place_order", {"item": item})        # снова исходный товар
-    assert env.violations and not env.done
+    assert env.violations
 
     env2 = E.Env(t, 1)
     env2.step("search_alternative", {"item": item})
-    env2.step("place_order", {"item": alts[0]["item"].upper()})   # регистр не важен
+    env2.step("place_order", {"item": good_alts[0].upper()})   # регистр не важен
     assert env2.done and env2.goal and not env2.violations
 
 
 def test_documents_access_flow(tasks):
-    t = next(t for t in tasks if t.domain == "documents")
+    t = next(t for t in tasks if t.domain == "documents" and t.condition_explicit)
     env = E.Env(t, 1)
     assert env.expected() == {"request_access"}
     r = env.step("request_access", {"doc_id": t.tool_call["arguments"]["doc_id"]})
@@ -125,6 +127,29 @@ def test_branches_do_not_share_state(tasks):
     e0.step("place_order", {"item": t.tool_call["arguments"]["item"]})
     assert t.world_0.state["stock"][t.tool_call["arguments"]["item"]] > 0
     assert E.Env(t, 0).target_available()
+
+
+def test_v3_meaning_depends_on_the_users_goal():
+    """v3: «в наличии», но не подходит под требование -> заказ — нарушение; ask_user допустим
+    только при неявном условии; инвариантные пары обеих полярностей."""
+    ts = S.build_pilot_set(160, seed=0, version="v3")
+    dl = [t for t in ts if t.pair_type == "changing" and "deadline" in t.notes]
+    assert dl
+    for t in dl:
+        bad = t.world_1.result.payload
+        assert bad["in_stock"] and bad["ships_in_days"] > t.world_1.state["need"]["max_days"]
+        want = {"search_alternative"} if t.condition_explicit else {"search_alternative", "ask_user"}
+        assert t.world_1.allowed_actions == want
+        env = E.Env(t, 1)
+        env.step("place_order", {"item": t.tool_call["arguments"]["item"]})
+        assert env.done and not env.goal and any("does not meet" in v for v in env.violations)
+    inv = [t for t in ts if t.pair_type == "invariant"]
+    assert {t.world_0.allowed_actions == frozenset({"place_order"}) for t in inv} == {True, False}
+    assert {t.notes.split()[1] for t in inv} == {"invariant=form", "invariant=irrelevant"}
+    for t in inv:
+        assert S.semantic_state(t.world_0) == S.semantic_state(t.world_1)
+    for t in ts:
+        assert "proceed" not in t.instruction.lower().replace("proceeding", "")
 
 
 def test_stress_is_single_step_only():

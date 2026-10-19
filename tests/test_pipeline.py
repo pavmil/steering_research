@@ -304,7 +304,7 @@ def test_hf_pipeline_end_to_end(chatml_tokenizer, root):
     be = HFBackend(make_tiny_llama(vocab=len(chatml_tokenizer)), chatml_tokenizer, "tiny", "cpu",
                    max_new_tokens=8)
     exp = _exp(root, backend=be, **{
-        "model.name": "tiny", "data.n_tasks": 20, "steer.alphas": [1.0],
+        "model.name": "tiny", "data.n_tasks": 40, "steer.alphas": [1.0],
         "steer.min_class_examples": 1, "steer.top_k_layers": 1,
         "steer.windows": ["post_message"], "probe.n_auto_layers": 2,
         "eval.methods": ["baseline", "restate", "steering"]})
@@ -328,7 +328,7 @@ def test_hf_pipeline_end_to_end(chatml_tokenizer, root):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["01_smoke_mock.ipynb", "00_TEMPLATE.ipynb",
+@pytest.mark.parametrize("name", ["01_smoke_mock.ipynb", "00_TEMPLATE.ipynb", "05_h1_h2_v3.ipynb",
                                   "03_h1_h2_baseline.ipynb", "04_h3_steering.ipynb"])
 def test_notebooks_execute_on_mock(name, tmp_path, monkeypatch):
     nbformat = pytest.importorskip("nbformat")

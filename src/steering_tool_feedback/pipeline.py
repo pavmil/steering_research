@@ -961,6 +961,159 @@ class Experiment:
         self._mark("transfer")
         return res
 
+    def lora_diagnostics(self, n_control: int = 20, form_layers: int = 3) -> dict[str, Any]:
+        """Диагностика LoRA как маркера (diagnose.py) на train: где и в какой форме дообучение меняет
+        активации. Не метод и не подбор: ничего не выбирается, test и val не используются.
+
+        1) подстановка LoRA → база по (слой × набор позиций) на промптах, где решения расходятся
+           (+ n_control промптов, где совпадают); 2) разбор Δh = h_LoRA − h_база по слоям в точке
+           решения и в окнах; 3) поведенческая проверка формы (CV по задачам): добавка постоянного,
+           условного по probe и линейного Δh в точке решения на form_layers лучших слоях.
+        """
+        from . import diagnose as D
+
+        self._need("fit")
+        specs = self._specs_for("lora")
+        if specs is None:
+            raise ValueError("LoRA не выбрана в fit — диагностировать нечего")
+        be = self.backend
+        if not hasattr(be, "model"):
+            raise NotImplementedError("диагностика LoRA требует настоящей модели (HF-бэкенд)")
+        ad = ResolvedAdapter(specs["adapter"].adapter_id, specs["adapter"].path)
+        first = D.first_tokens(be)
+        names = list(first)
+        layers = list(range(be.n_layers))
+        tasks = self._tasks("train", ("changing", "invariant"))
+        base_scored = {(r["task_id"], r["branch"]): r["action"]
+                       for r in self.state["records"]["train"]["baseline"] if r["trial"] == 0}
+        lora_scored = {(r["task_id"], r["branch"]): r["action"]
+                       for r in self.evaluate("lora", "train", write=False, **specs)}
+        meta, acts, patch_rows = [], {k: [] for k in ("base_last", "lora_last", "base_dec", "lora_dec",
+                                                     "base_tc", "lora_tc")}, []
+        n_ctrl = 0
+        for t, b in _progress([(t, b) for t in tasks for b in (0, 1)], "lora diagnostics",
+                              2 * len(tasks), disable=not self.verbose):
+            p = self._prompt(t, b)
+            ids = list(p.prepared.input_ids) + be._prefix_ids()
+            hb, lp_b = D.hidden_all(be, ids, layers, first)
+            hl, lp_l = D.hidden_all(be, ids, layers, first, ad)
+            wins = D.position_windows(p, len(ids))
+            dec, tc = wins["decision"], wins["tool_content"]
+            for key, h in (("base", hb), ("lora", hl)):
+                acts[f"{key}_last"].append(np.stack([h[L][-1] for L in layers]))
+                acts[f"{key}_dec"].append(np.stack([h[L][dec.start:dec.end].mean(0) for L in layers]))
+                acts[f"{key}_tc"].append(np.stack([h[L][tc.start:tc.end].mean(0) for L in layers]))
+            a_b, a_l = names[int(np.argmax(lp_b))], names[int(np.argmax(lp_l))]
+            w = t.branch(b)
+            m = {"task_id": t.task_id, "branch": b, "pair_type": t.pair_type,
+                 "need": (t.notes.split("need=")[1].split()[0] if "need=" in t.notes else t.domain),
+                 "state": S.semantic_state(w), "base_action": a_b, "lora_action": a_l,
+                 "base_ok": a_b in w.allowed_actions, "lora_ok": a_l in w.allowed_actions,
+                 "first_token_matches_scored": (a_b == base_scored.get((t.task_id, b)))
+                 and (a_l == lora_scored.get((t.task_id, b))), "base_lp": lp_b, "lora_lp": lp_l}
+            meta.append(m)
+            disagree = a_b != a_l
+            if disagree or n_ctrl < n_control:
+                n_ctrl += not disagree
+                for r in D.patch_sweep(be, p, ids, hl, lp_b, lp_l, first, layers):
+                    patch_rows.append({**{k: m[k] for k in ("task_id", "branch", "pair_type", "need",
+                                                             "base_action", "lora_action")},
+                                       "disagree": disagree, **r})
+            del hb, hl
+        import pandas as pd
+
+        A = {k: np.stack(v) for k, v in acts.items()}                     # [N, L, d]
+        np.savez_compressed(self.dir / "diag_acts.npz", **{k: v.astype(np.float16) for k, v in A.items()})
+        states = np.array([m["state"] for m in meta])
+        groups = np.array([m["task_id"] for m in meta])
+        pr = pd.DataFrame(patch_rows)
+        pr.to_csv(self.dir / "diag_patch.csv", index=False)
+        dis = pr[pr["disagree"]]
+        summ = (dis.groupby(["set", "layer"])
+                .agg(effect=("effect", "mean"), to_lora=("to_lora", "mean"), n=("effect", "size"))
+                .reset_index()) if not dis.empty else pd.DataFrame()
+        ctrl = pr[~pr["disagree"]]
+        if not summ.empty and not ctrl.empty:
+            keep = ctrl.groupby(["set", "layer"])["stays_base"].mean().rename("control_kept").reset_index()
+            summ = summ.merge(keep, on=["set", "layer"], how="left")
+        summ.to_csv(self.dir / "diag_patch_summary.csv", index=False)
+        dec_rows = []
+        for pos, (kb, kl) in {"last": ("base_last", "lora_last"), "decision": ("base_dec", "lora_dec"),
+                              "tool_content": ("base_tc", "lora_tc")}.items():
+            for i, L in enumerate(layers):
+                delta = A[kl][:, i].astype(np.float64) - A[kb][:, i].astype(np.float64)
+                r = D.delta_decomposition(delta, A[kb][:, i], states, groups, seed=self.cfg.data.seed)
+                dec_rows.append({"position": pos, "layer": L, **r})
+        dd = pd.DataFrame(dec_rows)
+        dd.to_csv(self.dir / "diag_delta.csv", index=False)
+        form = self._diag_form(D, A, meta, states, groups, layers, first, summ, form_layers)
+        pd.DataFrame(form).to_csv(self.dir / "diag_form.csv", index=False)
+        n_dis = sum(m["base_action"] != m["lora_action"] for m in meta)
+        res = {"n_prompts": len(meta), "n_disagree": n_dis, "n_control": n_ctrl,
+               "first_token_agreement": float(np.mean([m["first_token_matches_scored"] for m in meta])),
+               "lora_fixes": int(sum((not m["base_ok"]) and m["lora_ok"] for m in meta)),
+               "lora_breaks": int(sum(m["base_ok"] and not m["lora_ok"] for m in meta)),
+               "patch_summary": summ.to_dict("records"), "decomposition": dec_rows, "form_check": form,
+               "adapter": specs["adapter"].adapter_id}
+        self.state["diagnostics"] = res
+        self._save_json("diagnostics.json", {k: v for k, v in res.items() if k != "decomposition"})
+        self.log(f"lora diagnostics: {len(meta)} промптов train, решения LoRA и базы расходятся в {n_dis}; "
+                 f"первый токен = полный скоринг в {res['first_token_agreement']:.0%}")
+        self._mark("diagnose")
+        return res
+
+    def _diag_form(self, D: Any, A: dict, meta: list[dict], states: np.ndarray, groups: np.ndarray,
+                   layers: list[int], first: dict, summ: Any, form_layers: int) -> list[dict]:
+        """Поведенческая проверка формы Δh в точке решения: на отложенных задачах (CV) добавка
+        постоянного / условного по probe / линейного вектора — совпадает ли решение с LoRA."""
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import LogisticRegression, Ridge
+        from sklearn.model_selection import GroupKFold
+        from sklearn.preprocessing import StandardScaler
+
+        if summ is None or getattr(summ, "empty", True):
+            return []
+        last = summ[summ["set"] == "last"].sort_values("effect", ascending=False)
+        top = [int(x) for x in last["layer"].head(form_layers)]
+        tasks = {t.task_id: t for t in self._tasks("train", ("changing", "invariant"))}
+        names = list(first)
+        lora_a = np.array([m["lora_action"] for m in meta])
+        base_a = np.array([m["base_action"] for m in meta])
+        out = []
+        for L in top:
+            i = layers.index(L)
+            hb = A["base_last"][:, i].astype(np.float64)
+            delta = A["lora_last"][:, i].astype(np.float64) - hb
+            got = {k: np.empty(len(meta), dtype=object) for k in ("const", "probe", "linear")}
+            for tr, te in GroupKFold(n_splits=min(5, len(np.unique(groups)))).split(hb, states, groups):
+                m0 = delta[tr].mean(0)
+                by = {c: (delta[tr][states[tr] == c].mean(0) if np.any(states[tr] == c) else m0) for c in (0, 1)}
+                sc = StandardScaler().fit(hb[tr])
+                clf = LogisticRegression(C=1.0, max_iter=2000).fit(sc.transform(hb[tr]), states[tr])
+                pca = PCA(n_components=min(32, len(tr) - 1)).fit(sc.transform(hb[tr]))
+                reg = Ridge(alpha=10.0).fit(pca.transform(sc.transform(hb[tr])), delta[tr])
+                for j in te:
+                    m = meta[j]
+                    p = self._prompt(tasks[m["task_id"]], m["branch"])
+                    ids = list(p.prepared.input_ids) + self.backend._prefix_ids()
+                    z = sc.transform(hb[j:j + 1])
+                    vecs = {"const": m0, "probe": by[int(clf.predict(z)[0])],
+                            "linear": reg.predict(pca.transform(z))[0]}
+                    for k, v in vecs.items():
+                        lp = D.add_vector_decision(self.backend, p, ids, first, L, v)
+                        got[k][j] = names[int(np.argmax(lp))]
+            dis = base_a != lora_a
+            for k, a in got.items():
+                a = a.astype(str)
+                out.append({"layer": L, "form": k,
+                            "agree_with_lora": float(np.mean(a == lora_a)),
+                            "fixed_like_lora": float(np.mean(a[dis] == lora_a[dis])) if dis.any() else None,
+                            "kept_where_agree": float(np.mean(a[~dis] == base_a[~dis])) if (~dis).any() else None,
+                            "n": int(len(a))})
+            out.append({"layer": L, "form": "base", "agree_with_lora": float(np.mean(base_a == lora_a)),
+                        "fixed_like_lora": 0.0, "kept_where_agree": 1.0, "n": int(len(meta))})
+        return out
+
     def _comparisons(self, recs_by: dict[str, list[dict]]) -> dict[str, Any]:
         out = {}
         if "steering" in recs_by:

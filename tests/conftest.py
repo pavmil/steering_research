@@ -63,6 +63,8 @@ def make_chatml_tokenizer():
             corpus += [m.get("content", "") for m in t.prompt(b)]
     corpus += ["<tool_response>", "</tool_response>", "<tool_call>", "</tool_call>",
                "assistant", "user", "system"]
+    # имена действий — целыми токенами, как у настоящих токенизаторов (у всех разный первый токен)
+    corpus += [f'{{"name": "{a}"}}' for a in S.ACTIONS] * 20
     tk.train_from_iterator(corpus * 3, trainer)
 
     tok = PreTrainedTokenizerFast(

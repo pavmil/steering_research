@@ -335,3 +335,48 @@ def test_module_entrypoint(tmp_path):
     r = run("doctor")
     assert r.returncode == 0 and "core deps OK" in r.stdout, r.stdout[-500:]
     assert run("nope").returncode == 2
+
+
+# --------------------------------------------------------------------------
+# диагностика LoRA: форма Δh (numpy-часть)
+# --------------------------------------------------------------------------
+
+
+def _dd_data(kind, n=120, d=40, seed=0):
+    rng = np.random.default_rng(seed)
+    states = np.array([i % 2 for i in range(n)])
+    groups = np.array([f"t{i // 2}" for i in range(n)])
+    u = np.zeros(d)
+    u[0] = 1.0
+    base = rng.normal(size=(n, d)) + 6.0 * states[:, None] * u      # база «знает» состояние
+    v = rng.normal(size=d)
+    if kind == "const":
+        delta = np.tile(v, (n, 1))
+    elif kind == "state":
+        delta = np.where(states[:, None] == 1, v, -v)
+    else:  # linear
+        W = np.outer(rng.normal(size=d), rng.normal(size=d)) / d
+        delta = base @ W.T
+    return delta + 0.05 * rng.normal(size=(n, d)), base, states, groups
+
+
+def test_delta_decomposition_recognises_each_form():
+    from steering_tool_feedback.diagnose import delta_decomposition as dd
+
+    r = dd(*_dd_data("const"))
+    assert r["r2_const"] > 0.95
+    r = dd(*_dd_data("state"))
+    assert r["r2_const"] < 0.2 and r["r2_state"] > 0.95 and r["r2_probe"] > 0.8
+    assert r["rank90_centered"] == 1
+    r = dd(*_dd_data("linear"), n_pcs=40)
+    assert r["r2_linear"] > 0.8 and r["r2_linear"] > r["r2_const"] + 0.3
+
+
+def test_patch_effect():
+    from steering_tool_feedback.diagnose import patch_effect
+
+    base, lora = np.array([0.0, -5.0]), np.array([-5.0, 0.0])
+    assert patch_effect(base, lora, base, 0, 1) == 0.0
+    assert patch_effect(base, lora, lora, 0, 1) == 1.0
+    assert abs(patch_effect(base, lora, np.array([-2.5, -2.5]), 0, 1) - 0.5) < 1e-9
+    assert np.isnan(patch_effect(base, base, base, 0, 0))

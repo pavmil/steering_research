@@ -31,8 +31,8 @@ import numpy as np
 from .windows import PositionWindow, Window
 
 __all__ = [
-    "ActivationRecorder", "DriftAxis", "HookGroup", "PositionWindow", "ProjectionHook",
-    "SteerConfig", "SteeringHook", "SteeringVector", "drift_axis", "drift_clamp",
+    "ActivationRecorder", "DriftAxis", "HookGroup", "PatchHook", "PositionWindow", "ProjectionHook",
+    "SteerConfig", "SteeringHook", "SteeringVector", "drift_axis", "drift_clamp", "patched",
     "contrastive_vector", "dose_response", "get_layers", "lowrank_subspace", "n_layers",
     "permuted_direction", "random_direction_like", "shifted_layer", "shifted_window", "steering",
 ]
@@ -366,6 +366,7 @@ class _WindowHook:
         n = int(mask.sum())
         if n == 0:
             return out
+        self._last_pos = pos
         hidden = self._apply(hidden.clone(), mask)
         self.n_applied += n
         return _rejoin_output(hidden, rest)
@@ -463,6 +464,39 @@ class ProjectionHook(_WindowHook):
         self.n_changed += int((excess != 0).sum())
         hidden[:, mask, :] = (sel - self.lam * excess.unsqueeze(-1) * v).to(hidden.dtype)
         return hidden
+
+
+class PatchHook(_WindowHook):
+    """Подстановка: состояние в позициях окна заменяется значениями из другого прогона
+    (например, той же модели с LoRA). Только диагностика — где живёт эффект; в методах
+    подставлять ответ инструмента или готовое действие нельзя (AGENTS.md).
+
+    values — [len(window), hidden]: строка i — значение для позиции window.start + i.
+    """
+
+    def __init__(self, layer: int, window: PositionWindow, values: Any):
+        super().__init__()
+        if len(values) != len(window):
+            raise ValueError(f"values for {len(values)} positions, window has {len(window)}")
+        self.layer, self.window, self.values = layer, window, values
+
+    def _apply(self, hidden: Any, mask: Any) -> Any:
+        import torch
+
+        idx = (self._last_pos[mask] - self.window.start).long()
+        v = torch.as_tensor(np.asarray(self.values), device=hidden.device)
+        hidden[:, mask, :] = v[idx.cpu()].to(device=hidden.device, dtype=hidden.dtype).unsqueeze(0)
+        return hidden
+
+
+@contextmanager
+def patched(model: Any, layer: int, window: PositionWindow, values: Any) -> Iterator[PatchHook]:
+    hook = PatchHook(layer, window, values)
+    hook.attach(model)
+    try:
+        yield hook
+    finally:
+        hook.detach()
 
 
 class HookGroup:

@@ -550,3 +550,43 @@ def test_transfer_stage_on_mock(root, monkeypatch):
     monkeypatch.setattr(S, "build_transfer_set", lambda *a, **k: {"seen": train, "unseen": train})
     with pytest.raises(ValueError, match="overlaps"):
         exp2.transfer()
+
+
+def test_lora_diagnostics_needs_a_real_model(root):
+    exp = _exp(root, **{"eval.methods": ["baseline", "lora"]})
+    exp.run("fit")
+    with pytest.raises(NotImplementedError):
+        exp.lora_diagnostics()
+
+
+@pytest.mark.model
+def test_lora_diagnostics_end_to_end(chatml_tokenizer, root):
+    pytest.importorskip("peft")
+    from conftest import make_tiny_llama
+    from steering_tool_feedback.backends.hf import HFBackend
+
+    be = HFBackend(make_tiny_llama(vocab=len(chatml_tokenizer)), chatml_tokenizer, "tiny", "cpu")
+    exp = _exp(root, backend=be, **{
+        "model.name": "tiny", "data.n_tasks": 40, "steer.alphas": [1.0],
+        "steer.min_class_examples": 1, "steer.top_k_layers": 1, "steer.windows": ["post_message"],
+        "probe.n_auto_layers": 2, "episode.on_val": False,
+        "lora.grid": [{"lr": 0.01, "epochs": 2}], "lora.rank": 4, "lora.grad_accum": 1,
+        "steer.max_specificity_drop": 1.0,
+        "eval.methods": ["baseline", "lora"]})
+    exp.run("fit")
+    res = exp.lora_diagnostics(n_control=2, form_layers=1)
+    n_train = 2 * len(exp._tasks("train", ("changing", "invariant")))
+    assert res["n_prompts"] == n_train and 0.0 <= res["first_token_agreement"] <= 1.0
+    for f in ("diag_patch.csv", "diag_patch_summary.csv", "diag_delta.csv", "diag_form.csv",
+              "diag_acts.npz", "diagnostics.json"):
+        assert (exp.dir / f).exists(), f
+    import pandas as pd
+
+    dd = pd.read_csv(exp.dir / "diag_delta.csv")
+    assert set(dd["position"]) == {"last", "decision", "tool_content"} and len(dd) == 3 * be.n_layers
+    pr = pd.read_csv(exp.dir / "diag_patch.csv")
+    assert set(pr["set"]) == {"all", "tool_content", "field_read", "decision", "last"}
+    # подстановка ВСЕХ позиций на последнем слое = решение LoRA
+    last_all = pr[(pr["layer"] == be.n_layers - 1) & (pr["set"] == "all")]
+    assert last_all["to_lora"].all()
+    assert "diagnose" in exp.done

@@ -75,3 +75,41 @@ def compare_methods(results_df: Any):
     ax.invert_yaxis()
     fig.tight_layout()
     return fig
+
+
+def patch_heatmap(summary_df: Any, ax: Any = None):
+    """Подстановка LoRA → база: доля эффекта LoRA (0 — база, 1 — LoRA) по (набор позиций × слой),
+    на промптах, где решения LoRA и базы расходятся."""
+    plt = _plt()
+    if summary_df.empty:
+        raise ValueError("no disagreeing prompts — nothing to show")
+    order = [s for s in ("all", "decision", "last", "tool_content", "field_read") if s in set(summary_df["set"])]
+    pv = summary_df.pivot(index="set", columns="layer", values="effect").loc[order]
+    ax = ax or plt.subplots(figsize=(min(16, 1.0 + 0.45 * pv.shape[1]), 1.2 + 0.5 * pv.shape[0]))[1]
+    im = ax.imshow(pv.values, vmin=0.0, vmax=1.0, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(pv.shape[1]), pv.columns)
+    ax.set_yticks(range(pv.shape[0]), pv.index)
+    ax.set_xlabel("слой, на котором подставлено состояние LoRA")
+    ax.set_title("Сколько эффекта LoRA даёт подстановка (0 = база, 1 = LoRA)")
+    plt.colorbar(im, ax=ax, fraction=0.03)
+    return ax
+
+
+def delta_forms(delta_df: Any, position: str = "last", ax: Any = None):
+    """Какую долю Δh = h_LoRA − h_база на отложенных задачах воспроизводит каждая форма вмешательства."""
+    plt = _plt()
+    d = delta_df[delta_df["position"] == position].sort_values("layer")
+    if d.empty:
+        raise ValueError(f"no rows for position {position!r}")
+    ax = ax or plt.subplots(figsize=(8, 3.6))[1]
+    labels = {"r2_const": "постоянный вектор (CAA)", "r2_probe": "вектор по состоянию из probe",
+              "r2_state": "вектор по истинному состоянию (оракул)", "r2_linear": "линейное W·h (ранг 8)"}
+    for col, lab in labels.items():
+        ax.plot(d["layer"], d[col], marker="o", ms=3, label=lab, ls="--" if col == "r2_state" else "-")
+    ax.axhline(0, color="grey", lw=1)
+    ax.set_ylim(-0.1, 1.0)
+    ax.set_xlabel("слой")
+    ax.set_ylabel("R² (доля Δh)")
+    ax.set_title(f"Форма изменения, которое делает LoRA ({position})")
+    ax.legend(fontsize=7)
+    return ax

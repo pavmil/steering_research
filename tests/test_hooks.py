@@ -301,3 +301,48 @@ def test_drift_axis_per_problem():
     assert info2["mode"] == "global_means"
     with pytest.raises(ValueError):
         ST.drift_axis([], ok, [], groups, 3)
+
+
+# --------------------------------------------------------------------------
+# Подстановка активаций (диагностика)
+# --------------------------------------------------------------------------
+
+
+def test_patch_hook_replaces_exactly_the_window(tiny_model):
+    _, m = tiny_model
+    b = _inputs(m)
+    clean = _logits(m, b)
+    L, w = 1, PositionWindow(6, 11, "tool_content")
+    h = _hidden(m, b, L)
+    # подстановка собственных значений — ничего не меняет
+    with ST.patched(m, L, w, h[w.start:w.end]) as hook:
+        same = _logits(m, b)
+    assert hook.n_applied == len(w) and torch.allclose(clean, same, atol=1e-5)
+    # чужие значения: до окна всё как было, с окна — иначе; в слое L окно стало ровно тем, что подставили
+    other = np.random.default_rng(0).normal(size=(len(w), m.config.hidden_size)).astype(np.float32)
+    with ST.patched(m, L, w, other):
+        with ST.ActivationRecorder(m, [L]) as rec:
+            changed = m(**b).logits.clone()
+    assert np.allclose(rec.raw(L)[w.start:w.end], other, atol=1e-3)
+    assert torch.allclose(clean[:, : w.start], changed[:, : w.start], atol=1e-5)
+    assert not torch.allclose(clean[:, w.start:], changed[:, w.start:])
+    with pytest.raises(ValueError):
+        ST.PatchHook(L, w, other[:2])
+
+
+def test_patch_last_layer_reproduces_donor_logits(tiny_model):
+    """Подстановка ВСЕХ позиций на последнем слое = логиты донора (дальше только норма и голова)."""
+    name, m = tiny_model
+    import copy as _copy
+
+    donor = _copy.deepcopy(m)
+    with torch.no_grad():
+        for p in ST.get_layers(donor)[-1].parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    b = _inputs(m)
+    last = ST.n_layers(m) - 1
+    want = _logits(donor, b)
+    hd = _hidden(donor, b, last)
+    with ST.patched(m, last, PositionWindow(0, SEQ, "tool_content"), hd):
+        got = _logits(m, b)
+    assert torch.allclose(want, got, atol=1e-4), name

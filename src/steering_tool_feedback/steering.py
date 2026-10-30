@@ -31,8 +31,8 @@ import numpy as np
 from .windows import PositionWindow, Window
 
 __all__ = [
-    "ActivationRecorder", "DriftAxis", "HookGroup", "PatchHook", "PositionWindow", "ProjectionHook",
-    "SteerConfig", "SteeringHook", "SteeringVector", "drift_axis", "drift_clamp", "patched",
+    "ActivationRecorder", "AffineHook", "DriftAxis", "HookGroup", "PatchHook", "PositionWindow", "ProjectionHook",
+    "SteerConfig", "SteeringHook", "SteeringVector", "affine", "drift_axis", "drift_clamp", "patched",
     "contrastive_vector", "dose_response", "get_layers", "lowrank_subspace", "n_layers",
     "permuted_direction", "random_direction_like", "shifted_layer", "shifted_window", "steering",
 ]
@@ -492,6 +492,47 @@ class PatchHook(_WindowHook):
 @contextmanager
 def patched(model: Any, layer: int, window: PositionWindow, values: Any) -> Iterator[PatchHook]:
     hook = PatchHook(layer, window, values)
+    hook.attach(model)
+    try:
+        yield hook
+    finally:
+        hook.detach()
+
+
+class AffineHook(_WindowHook):
+    """Аффинная поправка в позициях окна: h ← h + α·(h·U·P + a0), U ∈ R^{d×r}, P ∈ R^{r×d}.
+
+    Одна форма для линейной интервенции в закрытой форме (interventions.fit_affine) и для LoReFT
+    при выводе. Вычисляется в float32, результат — в dtype модели.
+    """
+
+    def __init__(self, layer: int, window: PositionWindow, U: Any, P: Any, a0: Any, alpha: float = 1.0):
+        super().__init__()
+        self.layer, self.window, self.alpha = layer, window, float(alpha)
+        self.U, self.P, self.a0 = np.asarray(U, np.float32), np.asarray(P, np.float32), np.asarray(a0, np.float32)
+        if self.U.shape[1] != self.P.shape[0] or self.U.shape[0] != self.P.shape[1] != self.a0.shape[0]:
+            raise ValueError(f"bad affine shapes U{self.U.shape} P{self.P.shape} a0{self.a0.shape}")
+        self._t: tuple | None = None
+
+    # Всегда активен: при alpha = 0 поправка нулевая, но позиция засчитывается — проверка
+    # n_applied == len(окно) остаётся осмысленной.
+
+    def _apply(self, hidden: Any, mask: Any) -> Any:
+        import torch
+
+        if self._t is None or self._t[0].device != hidden.device:
+            self._t = tuple(torch.as_tensor(x, dtype=torch.float32, device=hidden.device)
+                            for x in (self.U, self.P, self.a0))
+        U, P, a0 = self._t
+        x = hidden[:, mask, :].float()
+        hidden[:, mask, :] = (x + self.alpha * ((x @ U) @ P + a0)).to(hidden.dtype)
+        return hidden
+
+
+@contextmanager
+def affine(model: Any, layer: int, window: PositionWindow, U: Any, P: Any, a0: Any,
+           alpha: float = 1.0) -> Iterator[AffineHook]:
+    hook = AffineHook(layer, window, U, P, a0, alpha)
     hook.attach(model)
     try:
         yield hook

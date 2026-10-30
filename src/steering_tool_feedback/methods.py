@@ -13,6 +13,10 @@
 | steering         | 5               | CAA-вектор в окне после ответа, всегда включён       |
 | steering_gated   | 6               | тот же вектор, но только если обучаемый гейт сработал |
 | tact             | адаптация       | TACT-Gate: оттягивание вдоль оси «сбой» в точке действия |
+| linmap_lora      | 07 → методы     | аффинная поправка в точке вызова, подогнанная в закрытой форме к Δh LoRA (учитель) |
+| linmap           | 07 → методы     | то же без учителя: цель — центроид верных состояний базы с тем же правильным действием |
+| reft             | 2404.03592      | LoReFT в точке вызова: обучение градиентом только вмешательства, веса модели заморожены |
+| cast             | 2409.05907      | CAST: условие (PC1 «не подходит / подходит», порог по F1) включает вектор поведения |
 | sham:*           | контроли H3     | случайное/переставленное направление, соседний слой, окно до ответа |
 
 Добавить новый метод = добавить запись в METHODS и, если нужно, ветку в
@@ -58,6 +62,8 @@ class MethodSpec:
     gate: bool = False              # steering только при срабатывании гейта (GateSpec)
     tact: bool = False              # адаптация TACT (TactSpec)
     adapter: bool = False           # LoRA-адаптер (AdapterSpec)
+    affine: bool = False            # аффинная поправка в точке вызова (AffineSpec)
+    cast: bool = False              # CAST: условие + вектор поведения (CastSpec)
     fitted: bool = False            # подбирается в стадии fit на val
     implemented: bool = True
     note: str = ""
@@ -82,6 +88,14 @@ METHODS: dict[str, MethodSpec] = {
                             "calibrated), без оси overthinking — решение без рассуждения."),
     "lora": MethodSpec("lora", "baseline", adapter=True, fitted=True,
                        note="LoRA/SFT на тех же данных, что и вектор (меняющие пары train)."),
+    "linmap_lora": MethodSpec("linmap_lora", "baseline", affine=True, fitted=True,
+                              note="Аффинная поправка в точке вызова, Δh LoRA в закрытой форме."),
+    "linmap": MethodSpec("linmap", "baseline", affine=True, fitted=True,
+                         note="Аффинная поправка в точке вызова без учителя, в закрытой форме."),
+    "reft": MethodSpec("reft", "baseline", affine=True, fitted=True,
+                       note="LoReFT в точке вызова (2404.03592), веса модели заморожены."),
+    "cast": MethodSpec("cast", "baseline", cast=True, fitted=True,
+                       note="CAST (2409.05907): условие по PC1 контраста состояний, порог по F1."),
 }
 
 for _s in ("random_direction", "permuted_coords", "layer_shift", "window_shift"):
@@ -168,6 +182,33 @@ class AdapterSpec:
 
 
 @dataclass
+class AffineSpec:
+    """linmap_lora / linmap / reft: аффинная карта (id = хеш U, P, a0) на слое, сила alpha."""
+
+    affine_id: str
+    layer: int
+    alpha: float = 1.0
+
+    def fingerprint(self) -> str:
+        return sha(["affine", self.affine_id, self.layer, round(self.alpha, 6)], 12)
+
+
+@dataclass
+class CastSpec:
+    """cast: условие (вектор cond_id на слое cond_layer, порог, направление) + вектор поведения."""
+
+    cond_layer: int
+    cond_id: str
+    theta: float
+    direction: str
+    behavior: SteerSpec
+
+    def fingerprint(self) -> str:
+        return sha(["cast", self.cond_layer, self.cond_id, round(self.theta, 6), self.direction,
+                    self.behavior.fingerprint()], 12)
+
+
+@dataclass
 class MethodRun:
     """Метод + параметры конкретного прогона (для fingerprint и кэша)."""
 
@@ -177,6 +218,8 @@ class MethodRun:
     gate: GateSpec | None = None
     tact: TactSpec | None = None
     adapter: AdapterSpec | None = None
+    affine: AffineSpec | None = None
+    cast: CastSpec | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def fingerprint(self) -> str:
@@ -187,7 +230,7 @@ class MethodRun:
             parts.append(sha(list(TWO_STEP[self.spec.variant])))
         if self.steer is not None:
             parts.append(self.steer.fingerprint())
-        for extra in (self.gate, self.tact, self.adapter):
+        for extra in (self.gate, self.tact, self.adapter, self.affine, self.cast):
             if extra is not None:
                 parts.append(extra.fingerprint())
         return sha(parts, 12)

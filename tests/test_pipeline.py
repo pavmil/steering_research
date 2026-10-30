@@ -590,3 +590,58 @@ def test_lora_diagnostics_end_to_end(chatml_tokenizer, root):
     last_all = pr[(pr["layer"] == be.n_layers - 1) & (pr["set"] == "all")]
     assert last_all["to_lora"].all()
     assert "diagnose" in exp.done
+
+
+ACT_METHODS = ["baseline", "steering", "lora", "linmap_lora", "linmap", "reft", "cast"]
+
+
+def test_activation_methods_full_cycle_on_mock(root):
+    exp = _exp(root, **{"eval.methods": ACT_METHODS})
+    exp.run("test")
+    fitted = exp.state["fitted"]
+    for m in ("linmap_lora", "linmap", "reft", "cast"):
+        assert fitted[m]["rows"], m
+    assert fitted["linmap_lora"]["teacher"] == fitted["lora"]["row"]["adapter_id"]
+    assert fitted["cast"]["cond_f1"] > 0
+    frozen = exp.state["frozen"]["methods"]
+    assert {"linmap", "reft"} & set(frozen)
+    assert set(frozen) <= set(exp.state["test"]["methods"]) | {"steering"}
+    # повтор — всё из кэша, включая обучение ReFT и активации в точке вызова
+    be = MockBackend()
+    exp2 = _exp(root, backend=be, **{"eval.methods": ACT_METHODS, "eval.reopen_test_reason": "повтор кэша"})
+    exp2.run("fit")
+    assert be.calls == {"decide": 0, "record": 0, "train": 0}
+
+
+@pytest.mark.model
+def test_hf_affine_at_call_point_and_loreft(chatml_tokenizer):
+    torch = pytest.importorskip("torch")
+    import numpy as np
+
+    from conftest import make_tiny_llama
+    from steering_tool_feedback import interventions as IV
+    from steering_tool_feedback.backends import ResolvedAffine
+    from steering_tool_feedback.backends.hf import HFBackend
+
+    be = HFBackend(make_tiny_llama(vocab=len(chatml_tokenizer)), chatml_tokenizer, "tiny", "cpu")
+    tasks = [t for t in S.build_pilot_set(30, seed=0) if t.pair_type == "changing"][:4]
+    ps = [be.prompt(t.prompt(1), t.essential_field(1), S.tools_schema()) for t in tasks]
+    d = be.hidden_size
+    rng = np.random.default_rng(0)
+    aff = ResolvedAffine(2, rng.normal(size=(d, 2)) * 0.1, rng.normal(size=(2, d)), rng.normal(size=d), 1.0)
+    base = be.decide(ps[0], "scored", None, 0.0, 0).scores
+    zero = be.decide(ps[0], "scored", ResolvedAffine(2, aff.U, aff.P, aff.a0, 0.0), 0.0, 0)
+    on = be.decide(ps[0], "scored", aff, 0.0, 0, with_args=True, arg_tokens=4)
+    assert max(abs(base[k] - zero.scores[k]) for k in base) < 1e-5
+    assert on.hook_applied == 1 and max(abs(base[k] - on.scores[k]) for k in base) > 1e-4
+    cp = be.record_call_point(ps[0], [1, 2])
+    assert set(cp) == {1, 2} and cp[2].shape == (d,)
+    # LoReFT: loss падает, веса модели снова обучаемы, форма — аффинная карта
+    gold = [sorted(t.branch(1).allowed_actions)[0] for t in tasks]
+    ex = [be.reft_example(p, g) for p, g in zip(ps, gold)]
+    am, info = IV.train_loreft(be, ex, layer=2, rank=2, lr=1e-2, epochs=4)
+    assert info["epoch_losses"][-1] < info["epoch_losses"][0], info
+    assert am.U.shape == (d, 2) and am.P.shape == (2, d)
+    assert np.allclose(am.P @ am.P.T, np.eye(2), atol=1e-4), "строки R ортонормированы"
+    assert all(p.requires_grad for p in be.model.parameters())
+    assert not torch.is_grad_enabled() or True

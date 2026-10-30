@@ -45,7 +45,8 @@ from ..actions import (ActionFormat, detect_action_format, name_tokens, parse_ac
 from ..simulator import ACTIONS, tool_call_message  # noqa: E402
 from ..store import sha  # noqa: E402
 from ..windows import prepare_prompt  # noqa: E402
-from .base import Decision, Prompt, ResolvedAdapter, ResolvedSteer, ResolvedTact  # noqa: E402
+from .base import (Decision, Prompt, ResolvedAdapter, ResolvedAffine, ResolvedSteer,  # noqa: E402
+                   ResolvedTact)
 
 
 def pick_device(pref: str = "auto") -> str:
@@ -162,11 +163,13 @@ class HFBackend:
 
         return torch.tensor([ids], dtype=torch.long, device=self.device)
 
-    def _steer_ctx(self, steer: ResolvedSteer | ResolvedTact | None):
+    def _steer_ctx(self, steer: ResolvedSteer | ResolvedTact | ResolvedAffine | None):
         if steer is None:
             return nullcontext(None)
         if isinstance(steer, ResolvedTact):
             return ST.drift_clamp(self.model, steer.axes, steer.window, steer.k, steer.lam)
+        if isinstance(steer, ResolvedAffine):
+            return ST.affine(self.model, steer.layer, steer.window, steer.U, steer.P, steer.a0, steer.alpha)
         return ST.steering(self.model, steer.vector,
                            ST.SteerConfig(alpha=steer.alpha, window=steer.window,
                                           normalize=steer.normalize))
@@ -337,10 +340,32 @@ class HFBackend:
                                         prefix=prefix)
         return parse_arguments(self.tok.decode(head, skip_special_tokens=False) + text), n_new
 
+    def _bind(self, steer, ids: list[int], mode: str):
+        """Аффинное вмешательство без окна — в точку вызова: последний токен промпта + префикса
+        вызова (scored) или последний токен промпта (generate: префикс пишет сама модель)."""
+        if isinstance(steer, ResolvedAffine) and steer.window is None:
+            import dataclasses
+
+            from ..windows import PositionWindow
+
+            i = len(ids) + (len(self._prefix_ids()) if mode == "scored" else 0) - 1
+            return dataclasses.replace(steer, window=PositionWindow(i, i + 1, "action_point"))
+        return steer
+
+    def record_call_point(self, prompt, layers, adapter=None) -> dict[int, np.ndarray]:
+        """Скрытое состояние в точке вызова (последний токен промпта + префикса) на слоях."""
+        import torch
+
+        ids = list(prompt.prepared.input_ids) + self._prefix_ids()
+        with self._adapter_ctx(adapter), torch.no_grad(), ST.ActivationRecorder(self.model, layers) as rec:
+            self.model(input_ids=self._tensor(ids), logits_to_keep=1)
+            return {L: rec._store[L][0, -1].float().numpy().astype(np.float32) for L in layers}
+
     def decide(self, prompt, mode, steer, temperature, trial, adapter=None, with_args=False,
                arg_tokens=40) -> Decision:
         t0 = time.perf_counter()
         ids = prompt.prepared.input_ids
+        steer = self._bind(steer, ids, mode)
         with self._adapter_ctx(adapter):
             prefix = self._system_prefix(ids, prompt.messages, prompt.tools, steer)
             if mode == "scored":
@@ -430,6 +455,15 @@ class HFBackend:
         if gen != prompt.prepared.text:
             raise ValueError("SFT prompt differs from the evaluated prompt")
         return list(prompt.prepared.input_ids), self._ids(full[len(gen):])
+
+    def reft_example(self, prompt: Prompt, action: str) -> tuple[list[int], list[int]]:
+        """(промпт + префикс вызова, токены имени действия) — пример для LoReFT в точке вызова."""
+        return list(prompt.prepared.input_ids) + self._prefix_ids(), list(self._candidates()[action])
+
+    def train_reft(self, examples, layer, rank, lr, epochs, seed=0):
+        from ..interventions import train_loreft
+
+        return train_loreft(self, examples, layer, rank, lr, epochs, seed)
 
     def train_adapter(self, examples, lora_cfg, lr, epochs, out_dir) -> dict[str, Any]:
         from ..finetune import train_lora

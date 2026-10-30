@@ -380,3 +380,59 @@ def test_patch_effect():
     assert patch_effect(base, lora, lora, 0, 1) == 1.0
     assert abs(patch_effect(base, lora, np.array([-2.5, -2.5]), 0, 1) - 0.5) < 1e-9
     assert np.isnan(patch_effect(base, base, base, 0, 0))
+
+
+# --------------------------------------------------------------------------
+# вмешательства в точке вызова: подгонка в закрытой форме, CAST
+# --------------------------------------------------------------------------
+
+
+def test_fit_affine_recovers_low_rank_map():
+    from steering_tool_feedback import interventions as IV
+
+    rng = np.random.default_rng(0)
+    n, d, r = 200, 24, 3
+    H = rng.normal(size=(n, d)) * rng.uniform(0.5, 3, size=d) + rng.normal(size=d)
+    A = rng.normal(size=(d, r)) @ rng.normal(size=(r, d)) / d
+    c = rng.normal(size=d)
+    D = H @ A + c
+    am = IV.fit_affine(H, D, rank=r, n_pcs=d, ridge=1e-3)
+    assert am.rank == r and am.U.shape == (d, r) and am.P.shape == (r, d)
+    assert am.info["train_r2"] > 0.99
+    Hn = rng.normal(size=(50, d)) * 2
+    assert np.allclose(am(Hn), Hn @ A + c, atol=0.05 * np.abs(Hn @ A + c).max())
+
+
+def test_contrast_targets():
+    from steering_tool_feedback import interventions as IV
+
+    H = np.array([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [4.0, 4.0]])
+    correct = [True, True, False, False]
+    gold = ["a", "b", "a", "b"]
+    D = IV.contrast_targets(H, correct, gold)
+    assert np.allclose(D[:2], 0)
+    assert np.allclose(D[2], [0.0, -2.0]) and np.allclose(D[3], [-2.0, -4.0])
+    with pytest.raises(ValueError):
+        IV.contrast_targets(H, [False] * 4, gold)
+
+
+def test_cast_pieces():
+    from steering_tool_feedback import interventions as IV
+
+    rng = np.random.default_rng(0)
+    d = 16
+    c_true = np.zeros(d)
+    c_true[0] = 1.0
+    # как у настоящих скрытых состояний: классы различаются величиной проекции, а не знаком
+    # (sim из CAST знаковонезависима — меряет выравнивание с c)
+    pos = rng.normal(size=(40, d)) + 8 * c_true
+    neg = rng.normal(size=(40, d)) + 1 * c_true
+    c = IV.pc1_direction(pos, neg)
+    assert c @ c_true > 0.9 and abs(np.linalg.norm(c) - 1) < 1e-9
+    X = np.concatenate([pos, neg])
+    y = np.array([1] * 40 + [0] * 40)
+    sim = IV.cast_similarity(X, c)
+    cond = IV.cast_condition(sim, y)
+    assert cond["f1"] > 0.95
+    fired = np.array([IV.cast_fires(s, cond) for s in sim])
+    assert (fired == (y == 1)).mean() > 0.95

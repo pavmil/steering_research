@@ -43,11 +43,11 @@ from . import metrics as M
 from . import probe as P
 from . import simulator as S
 from . import steering as ST
-from .backends import (Prompt, ResolvedAdapter, ResolvedSteer, ResolvedTact, auto_layers,
-                       load_backend)
+from .backends import (Prompt, ResolvedAdapter, ResolvedAffine, ResolvedSteer, ResolvedTact,
+                       auto_layers, load_backend)
 from .config import ExperimentConfig
-from .methods import (TWO_STEP, AdapterSpec, GateSpec, MethodRun, SteerSpec, TactSpec,
-                      build_messages, get_method)
+from .methods import (TWO_STEP, AdapterSpec, AffineSpec, CastSpec, GateSpec, MethodRun, SteerSpec,
+                      TactSpec, build_messages, get_method)
 from .store import ActivationCache, DecisionCache, Store, env_info, git_info, sha, write_jsonl
 from .windows import PositionWindow
 
@@ -102,6 +102,8 @@ class Experiment:
         self.vectors_by_id: dict[str, ST.SteeringVector] = {}
         self.gates_by_id: dict[str, dict[str, Any]] = {}
         self.axes_by_id: dict[str, list[ST.DriftAxis]] = {}
+        self.affines_by_id: dict[str, Any] = {}
+        self.cast_conds: dict[str, np.ndarray] = {}
         self._prompts: dict[tuple, Prompt] = {}
         self._dcache: DecisionCache | None = None
         self._acache: ActivationCache | None = None
@@ -233,6 +235,20 @@ class Experiment:
             out = dict(self._model_decision(sub, p, trial, with_args))
             out.update(gate_p=round(prob, 4), gate_on=bool(on))
             return out
+        if mr.cast is not None:
+            # CAST: условие проверяется по активациям промпта (последний токен), вектор поведения
+            # добавляется, только если оно сработало; решения — из кэша steering или базы.
+            from . import interventions as IV
+
+            c = mr.cast
+            k = ActivationCache.key(c.cond_layer, "action_point")
+            h = self._acts([p], [c.cond_layer], ["action_point"])[0][k]
+            on = IV.cast_fires(float(IV.cast_similarity(h, self.cast_conds[c.cond_id])[0]),
+                               {"theta": c.theta, "direction": c.direction})
+            sub = MethodRun(get_method("steering" if on else "baseline"), steer=c.behavior if on else None)
+            out = dict(self._model_decision(sub, p, trial, with_args))
+            out.update(gate_on=bool(on))
+            return out
         dcache, _ = self._caches()
         fmt = self.backend.info().get("action_format")
         dc = self.cfg.decision
@@ -254,7 +270,8 @@ class Experiment:
                 d = self.backend.decide_two_step(p, ask, go, n_ask, dc.mode, dc.temperature, trial, **kw)
             else:
                 steer = (self._resolve(mr.steer, p) if mr.steer is not None else
-                         self._resolve_tact(mr.tact, p) if mr.tact is not None else None)
+                         self._resolve_tact(mr.tact, p) if mr.tact is not None else
+                         self._resolve_affine(mr.affine) if mr.affine is not None else None)
                 d = self.backend.decide(p, dc.mode, steer, dc.temperature, trial, **kw)
             out = {"key": key, "action": d.action, "scores": d.scores,
                    "text": (d.text or "")[:2000], "n_prompt_tokens": d.n_prompt_tokens,
@@ -267,13 +284,19 @@ class Experiment:
             self.flags.append("позиции хука взяты из счётчика, а не из модели — проверить окна")
         return {**out, "cached": cached}
 
+    def _resolve_affine(self, spec: AffineSpec) -> ResolvedAffine:
+        am = self.affines_by_id[spec.affine_id]
+        return ResolvedAffine(spec.layer, am.U, am.P, am.a0, spec.alpha)
+
     def _run(self, method: str, steer: SteerSpec | None = None, gate: GateSpec | None = None,
-             tact: TactSpec | None = None, adapter: AdapterSpec | None = None) -> MethodRun:
+             tact: TactSpec | None = None, adapter: AdapterSpec | None = None,
+             affine: AffineSpec | None = None, cast: CastSpec | None = None) -> MethodRun:
         spec = get_method(method)
         mr = MethodRun(spec, strong_prompt=self.cfg.eval.strong_prompt, steer=steer, gate=gate,
-                       tact=tact, adapter=adapter)
+                       tact=tact, adapter=adapter, affine=affine, cast=cast)
         need = {"steer": (spec.steer, steer), "gate": (spec.gate, gate), "tact": (spec.tact, tact),
-                "adapter": (spec.adapter, adapter)}
+                "adapter": (spec.adapter, adapter), "affine": (spec.affine, affine),
+                "cast": (spec.cast, cast)}
         for k, (wanted, given) in need.items():
             if wanted and given is None:
                 raise ValueError(f"method {method!r} needs a {k} spec")
@@ -837,6 +860,200 @@ class Experiment:
             res["reason"] = "все конфигурации LoRA роняют специфичность сверх допуска"
         return res
 
+    # --- вмешательства в точке вызова (interventions.py) --------------------
+    def _act_layers(self, fracs: list[float] | None = None) -> list[int]:
+        c = self.cfg.act
+        if c.layers != "auto" and fracs is None:
+            return list(c.layers)
+        n = self.backend.n_layers
+        return sorted({min(n - 1, max(0, int(round(f * n)))) for f in (fracs or c.layer_fracs)})
+
+    def _call_point_acts(self, prompts: list[Prompt], layers: list[int],
+                         adapter: ResolvedAdapter | None = None) -> list[dict[int, np.ndarray]]:
+        """Состояния в точке вызова (кэш: ключ L{слой}|call_point[@адаптер])."""
+        _, acache = self._caches()
+        tag = "call_point" + (f"@{adapter.adapter_id}" if adapter else "")
+        out = []
+        for p in _progress(prompts, f"acts {tag}", len(prompts), disable=not self.verbose or len(prompts) < 4):
+            got = acache.load(p.key)
+            keys = {L: f"L{L}|{tag}" for L in layers}
+            if not all(k in got for k in keys.values()):
+                rec = self.backend.record_call_point(p, layers, adapter)
+                acache.save(p.key, {keys[L]: v for L, v in rec.items()})
+                got = acache.load(p.key)
+            out.append({L: got[keys[L]] for L in layers})
+        return out
+
+    def _train_changing(self) -> tuple[list[S.PairedTask], list[tuple[str, int]]]:
+        """Те же данные, что у вектора и LoRA: меняющие пары train, обе ветки."""
+        tasks = self._tasks("train", ("changing",))
+        return tasks, [(t.task_id, b) for t in tasks for b in (0, 1)]
+
+    def _fit_affine_grid(self, name: str, maps: dict[int, Any], alphas: list[float],
+                         extra: dict[int, dict] | None = None) -> dict[str, Any]:
+        """Оценка аффинных карт (слой → AffineMap) на val по сетке alpha, выбор общим правилом."""
+        base = self.state["records"]["val"]["baseline"]
+        bs = self.state["summaries"]["val"]["baseline"]
+        res: dict[str, Any] = {"rows": [], "row": None}
+        for (L, r), am in maps.items():
+            aid = sha(np.concatenate([am.U.ravel(), am.P.ravel(), am.a0]).tobytes(), 12)
+            self.affines_by_id[aid] = am
+            for a in alphas:
+                spec = AffineSpec(aid, L, float(a))
+                recs = self.evaluate(name, "val", write=False, affine=spec, tag=f"{name} L{L}/r{r}/a{a}")
+                res["rows"].append(self._row(self.summarize(recs, base), bs, layer=L, rank=r, alpha=float(a),
+                                             affine_id=aid, **(extra or {}).get((L, r), {}),
+                                             train_r2=am.info.get("train_r2")))
+        res["row"] = _select(res["rows"], self.cfg.steer.max_specificity_drop)
+        if res["row"] is None:
+            res["reason"] = "все конфигурации роняют специфичность сверх допуска"
+        adir = self.dir / "affine"
+        adir.mkdir(exist_ok=True)
+        for aid in {r["affine_id"] for r in res["rows"]}:
+            am = self.affines_by_id[aid]
+            np.savez(adir / f"{name}_{aid}.npz", U=am.U, P=am.P, a0=am.a0)
+        return res
+
+    def _fit_linmap_lora(self) -> dict[str, Any]:
+        """Δh = h_LoRA − h_база в точке вызова, подогнанный в закрытой форме (LoRA — учитель)."""
+        from . import interventions as IV
+
+        specs = self._specs_for("lora")
+        if specs is None:
+            return {"rows": [], "row": None, "reason": "LoRA не выбрана — нет учителя"}
+        ad = ResolvedAdapter(specs["adapter"].adapter_id, specs["adapter"].path)
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        prompts = [self._prompt(by[t], b) for t, b in keys]
+        layers, c = self._act_layers(), self.cfg.act
+        t0 = time.perf_counter()
+        hb, hl = self._call_point_acts(prompts, layers), self._call_point_acts(prompts, layers, ad)
+        t_acts = time.perf_counter() - t0
+        maps, t0 = {}, time.perf_counter()
+        for L in layers:
+            H = np.stack([x[L] for x in hb])
+            D = np.stack([x[L] for x in hl]) - H
+            for r in c.ranks:
+                maps[(L, r)] = IV.fit_affine(H, D, r, c.n_pcs, c.ridge, self.cfg.data.seed)
+        cost = {"acts_seconds": round(t_acts, 1), "fit_seconds": round(time.perf_counter() - t0, 1),
+                "n_examples": len(prompts)}
+        res = self._fit_affine_grid("linmap_lora", maps, c.alphas)
+        res.update(teacher=specs["adapter"].adapter_id, cost=cost)
+        return res
+
+    def _fit_linmap(self) -> dict[str, Any]:
+        """Без учителя: цель — центроид верных состояний базы с тем же правильным действием."""
+        from . import interventions as IV
+
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        ok = self._train_ok(("changing",))
+        prompts = [self._prompt(by[t], b) for t, b in keys]
+        correct = [ok[k] for k in keys]
+        gold = [sorted(by[t].branch(b).allowed_actions)[0] for t, b in keys]
+        if all(correct) or not any(correct):
+            return {"rows": [], "row": None, "reason": "нужны и верные, и неверные решения базы на train"}
+        layers, c = self._act_layers(), self.cfg.act
+        t0 = time.perf_counter()
+        hb = self._call_point_acts(prompts, layers)
+        t_acts = time.perf_counter() - t0
+        maps, t0 = {}, time.perf_counter()
+        for L in layers:
+            H = np.stack([x[L] for x in hb])
+            D = IV.contrast_targets(H, correct, gold)
+            for r in c.ranks:
+                maps[(L, r)] = IV.fit_affine(H, D, r, c.n_pcs, c.ridge, self.cfg.data.seed)
+        cost = {"acts_seconds": round(t_acts, 1), "fit_seconds": round(time.perf_counter() - t0, 1),
+                "n_examples": len(prompts)}
+        res = self._fit_affine_grid("linmap", maps, c.alphas)
+        res["cost"] = cost
+        return res
+
+    def _fit_reft(self) -> dict[str, Any]:
+        """LoReFT в точке вызова: обучается только вмешательство (градиентом), веса модели заморожены.
+        Обученные карты кэшируются по данным и гиперпараметрам (как адаптеры LoRA)."""
+        from . import interventions as IV
+
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        examples = [self.backend.reft_example(self._prompt(by[t], b), sorted(by[t].branch(b).allowed_actions)[0])
+                    for t, b in keys]
+        c = self.cfg.act
+        data_id = sha(examples, 12)
+        rdir = self.store.cache_dir(self.backend.model_key) / "reft"
+        rdir.mkdir(exist_ok=True)
+        maps, extra = {}, {}
+        for L in self._act_layers(c.reft_layer_fracs):
+            rid = sha([self.backend.model_key, data_id, L, c.reft_rank, c.reft_lr, c.reft_epochs,
+                       self.cfg.data.seed], 12)
+            f = rdir / f"{rid}.npz"
+            if f.exists():
+                z = np.load(f, allow_pickle=False)
+                am = IV.AffineMap(z["U"], z["P"], z["a0"], {"rank": c.reft_rank, "layer": L})
+                info = json.loads(str(z["info"]))
+            else:
+                self.log(f"reft: обучение L{L}, ранг {c.reft_rank} на {len(examples)} примерах …")
+                am, info = self.backend.train_reft(examples, L, c.reft_rank, c.reft_lr, c.reft_epochs,
+                                                   self.cfg.data.seed)
+                np.savez(f, U=am.U, P=am.P, a0=am.a0, info=json.dumps(info))
+                self.log(f"reft: L{L} готов за {info['train_seconds']} с, loss по эпохам {info['epoch_losses']}")
+            maps[(L, c.reft_rank)] = am
+            extra[(L, c.reft_rank)] = {"train_seconds": info["train_seconds"], "n_trainable": info["n_trainable"]}
+        return self._fit_affine_grid("reft", maps, [1.0], extra)
+
+    def _fit_cast(self) -> dict[str, Any]:
+        """CAST (2409.05907): вектор условия — PC1 центрированного контраста «не подходит / подходит»
+        в последнем токене промпта; слой, порог и направление — по F1 на train. Вектор поведения —
+        PC1 контраста «база не заказала / заказала» в окне generation prompt; слой и сила — на val."""
+        from . import interventions as IV
+
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        prompts = [self._prompt(by[t], b) for t, b in keys]
+        state = np.array([S.semantic_state(by[t].branch(b)) for t, b in keys])
+        acts_recs = {(r["task_id"], r["branch"]): r["action"]
+                     for r in self.state["records"]["train"]["baseline"] if r["trial"] == 0}
+        neg_act = np.array([acts_recs[k] in ("search_alternative", "ask_user", "request_access",
+                                             "stop_no_option") for k in keys])
+        all_layers = list(range(self.backend.n_layers))
+        acts = self._acts(prompts, all_layers, ["action_point", "pre_action"])
+        best = {"f1": -1.0}
+        for L in all_layers:
+            X = np.stack([a[ActivationCache.key(L, "action_point")] for a in acts]).astype(np.float64)
+            cvec = IV.pc1_direction(X[state == 1], X[state == 0])
+            cond = IV.cast_condition(IV.cast_similarity(X, cvec), state)
+            if cond["f1"] > best["f1"]:
+                best = {**cond, "layer": L, "vec": cvec}
+        cid = sha(best["vec"].tobytes(), 12)
+        self.cast_conds[cid] = best["vec"]
+        res: dict[str, Any] = {"rows": [], "row": None, "cond_layer": best["layer"], "cond_f1": best["f1"],
+                               "cond_id": cid}
+        if not neg_act.any() or neg_act.all():
+            res["reason"] = "у базы нет контраста «не заказала / заказала» на train"
+            return res
+        base = self.state["records"]["val"]["baseline"]
+        bs = self.state["summaries"]["val"]["baseline"]
+        for L in self._act_layers(self.cfg.act.cast_behavior_fracs):
+            X = np.stack([a[ActivationCache.key(L, "pre_action")] for a in acts]).astype(np.float64)
+            v = IV.pc1_direction(X[neg_act], X[~neg_act]).astype(np.float32)
+            sv = ST.SteeringVector(L, v, "pre_action", {"split": "train", "contrast": "CAST behavior"})
+            vid = sha(v.tobytes() + str(L).encode(), 12)
+            self.vectors_by_id[vid] = sv
+            for a in self.cfg.act.cast_alphas:
+                cs = CastSpec(best["layer"], cid, best["theta"], best["direction"],
+                              SteerSpec(L, "pre_action", float(a), vid, True))
+                recs = self.evaluate("cast", "val", write=False, cast=cs, tag=f"cast L{L}/a{a}")
+                s = self.summarize(recs, base)
+                res["rows"].append(self._row(s, bs, layer=L, alpha=float(a), vector_id=vid,
+                                             cond_layer=best["layer"], theta=best["theta"],
+                                             direction=best["direction"], cond_id=cid,
+                                             fire_rate=s.get("gate_on_rate")))
+        res["row"] = _select(res["rows"], self.cfg.steer.max_specificity_drop)
+        if res["row"] is None:
+            res["reason"] = "все конфигурации роняют специфичность сверх допуска"
+        np.savez(self.dir / f"cast_{cid}.npz", cond=best["vec"])
+        return res
+
     def _specs_for(self, method: str) -> dict[str, Any] | None:
         """Параметры выбранного (на val) метода для evaluate; None — метод не выбран."""
         if method == "steering":
@@ -852,14 +1069,21 @@ class Experiment:
             return {"tact": self._tact_spec(r)}
         if method == "lora":
             return {"adapter": AdapterSpec(r["adapter_id"], r["path"])}
+        if method in ("linmap_lora", "linmap", "reft"):
+            return {"affine": AffineSpec(r["affine_id"], r["layer"], r["alpha"])}
+        if method == "cast":
+            return {"cast": CastSpec(r["cond_layer"], r["cond_id"], r["theta"], r["direction"],
+                                     SteerSpec(r["layer"], "pre_action", r["alpha"], r["vector_id"], True))}
         raise KeyError(method)
 
     def fit(self) -> dict[str, Any]:
         """Обучаемые конкуренты (train -> выбор на val) и сравнение всех методов на val."""
         self._need("sweep")
         fitted: dict[str, Any] = {}
-        for m in self.cfg.eval.methods:
+        order = sorted(self.cfg.eval.methods, key=lambda m: m != "lora")   # LoRA — раньше учеников
+        for m in order:
             if get_method(m).fitted:
+                self.state["fitted"] = fitted          # ученики (linmap_lora) видят выбранную LoRA
                 fitted[m] = getattr(self, f"_fit_{m}")()
                 r = fitted[m]["row"]
                 self.log(f"fit {m}: " + (f"выбрано, успех {r['base_success']:.3f} → {r['success']:.3f}, "
@@ -961,14 +1185,16 @@ class Experiment:
         self._mark("transfer")
         return res
 
-    def lora_diagnostics(self, n_control: int = 20, form_layers: int = 3) -> dict[str, Any]:
+    def lora_diagnostics(self, n_control: int = 20, form_layers: int | list[int] = 3,
+                         patch: bool = True) -> dict[str, Any]:
         """Диагностика LoRA как маркера (diagnose.py) на train: где и в какой форме дообучение меняет
         активации. Не метод и не подбор: ничего не выбирается, test и val не используются.
 
         1) подстановка LoRA → база по (слой × набор позиций) на промптах, где решения расходятся
            (+ n_control промптов, где совпадают); 2) разбор Δh = h_LoRA − h_база по слоям в точке
            решения и в окнах; 3) поведенческая проверка формы (CV по задачам): добавка постоянного,
-           условного по probe и линейного Δh в точке решения на form_layers лучших слоях.
+           условного по probe и линейного Δh в точке решения на form_layers лучших слоях
+           (или на явно заданных). patch=False — без подстановки (её ~3 ч), только разбор и форма.
         """
         from . import diagnose as D
 
@@ -1013,7 +1239,7 @@ class Experiment:
                  and (a_l == lora_scored.get((t.task_id, b))), "base_lp": lp_b, "lora_lp": lp_l}
             meta.append(m)
             disagree = a_b != a_l
-            if disagree or n_ctrl < n_control:
+            if patch and (disagree or n_ctrl < n_control):
                 n_ctrl += not disagree
                 for r in D.patch_sweep(be, p, ids, hl, lp_b, lp_l, first, layers):
                     patch_rows.append({**{k: m[k] for k in ("task_id", "branch", "pair_type", "need",
@@ -1026,7 +1252,9 @@ class Experiment:
         np.savez_compressed(self.dir / "diag_acts.npz", **{k: v.astype(np.float16) for k, v in A.items()})
         states = np.array([m["state"] for m in meta])
         groups = np.array([m["task_id"] for m in meta])
-        pr = pd.DataFrame(patch_rows)
+        pr = pd.DataFrame(patch_rows, columns=["task_id", "branch", "pair_type", "need", "base_action",
+                                               "lora_action", "disagree", "layer", "set", "n_positions",
+                                               "effect", "to_lora", "stays_base"])
         pr.to_csv(self.dir / "diag_patch.csv", index=False)
         dis = pr[pr["disagree"]]
         summ = (dis.groupby(["set", "layer"])
@@ -1063,7 +1291,7 @@ class Experiment:
         return res
 
     def _diag_form(self, D: Any, A: dict, meta: list[dict], states: np.ndarray, groups: np.ndarray,
-                   layers: list[int], first: dict, summ: Any, form_layers: int) -> list[dict]:
+                   layers: list[int], first: dict, summ: Any, form_layers: int | list[int]) -> list[dict]:
         """Поведенческая проверка формы Δh в точке решения: на отложенных задачах (CV) добавка
         постоянного / условного по probe / линейного вектора — совпадает ли решение с LoRA."""
         from sklearn.decomposition import PCA
@@ -1071,10 +1299,13 @@ class Experiment:
         from sklearn.model_selection import GroupKFold
         from sklearn.preprocessing import StandardScaler
 
-        if summ is None or getattr(summ, "empty", True):
+        if isinstance(form_layers, (list, tuple)):
+            top = [int(x) for x in form_layers]
+        elif summ is None or getattr(summ, "empty", True):
             return []
-        last = summ[summ["set"] == "last"].sort_values("effect", ascending=False)
-        top = [int(x) for x in last["layer"].head(form_layers)]
+        else:
+            last = summ[summ["set"] == "last"].sort_values("effect", ascending=False)
+            top = [int(x) for x in last["layer"].head(form_layers)]
         tasks = {t.task_id: t for t in self._tasks("train", ("changing", "invariant"))}
         names = list(first)
         lora_a = np.array([m["lora_action"] for m in meta])
@@ -1140,7 +1371,11 @@ class Experiment:
             fr = f.get("row")
             if fr is None:
                 continue
-            keep = {"steering_gated": ("layer", "window", "alpha", "vector_id", "gate_id", "threshold"),
+            keep = {"linmap_lora": ("affine_id", "layer", "rank", "alpha"),
+                    "linmap": ("affine_id", "layer", "rank", "alpha"),
+                    "reft": ("affine_id", "layer", "rank", "alpha"),
+                    "cast": ("cond_layer", "cond_id", "theta", "direction", "layer", "vector_id", "alpha"),
+                    "steering_gated": ("layer", "window", "alpha", "vector_id", "gate_id", "threshold"),
                     "tact": ("axes_id", "layers", "k", "lam"),
                     "lora": ("adapter_id", "lr", "epochs")}[m]
             methods[m] = {k: fr[k] for k in keep}
@@ -1164,6 +1399,13 @@ class Experiment:
         if "steering_gated" in methods:
             g = self.gates_by_id[methods["steering_gated"]["gate_id"]]
             np.savez(fdir / f"{fid}_gate.npz", **{k: np.asarray(x) for k, x in g.items()})
+        for m in ("linmap_lora", "linmap", "reft"):
+            if m in methods:
+                am = self.affines_by_id[methods[m]["affine_id"]]
+                np.savez(fdir / f"{fid}_{m}.npz", U=am.U, P=am.P, a0=am.a0)
+        if "cast" in methods:
+            np.savez(fdir / f"{fid}_cast.npz", cond=self.cast_conds[methods["cast"]["cond_id"]],
+                     behavior=self.vectors_by_id[methods["cast"]["vector_id"]].vector)
         if "tact" in methods:
             axes = self.axes_by_id[methods["tact"]["axes_id"]]
             np.savez(fdir / f"{fid}_tact.npz", units=np.stack([a.unit for a in axes]),

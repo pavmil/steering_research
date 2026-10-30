@@ -42,6 +42,19 @@ class ResolvedTact:
 
 
 @dataclass
+class ResolvedAffine:
+    """Аффинная поправка h ← h + α·(h·U·P + a0) на одном слое. window=None — точка вызова:
+    последний токен перед именем действия (промпт + префикс вызова); её позицию знает бэкенд."""
+
+    layer: int
+    U: Any
+    P: Any
+    a0: Any
+    alpha: float = 1.0
+    window: PositionWindow | None = None
+
+
+@dataclass
 class ResolvedAdapter:
     """LoRA-адаптер: включается только на время решения, база не меняется."""
 
@@ -49,7 +62,7 @@ class ResolvedAdapter:
     path: str
 
 
-Intervention = ResolvedSteer | ResolvedTact
+Intervention = ResolvedSteer | ResolvedTact | ResolvedAffine
 
 
 @dataclass
@@ -88,6 +101,9 @@ class Backend(Protocol):
 
     def record(self, prompt: Prompt, layers: list[int],
                windows: list[str]) -> dict[tuple[int, str], np.ndarray]: ...
+
+    def record_call_point(self, prompt: Prompt, layers: list[int],
+                          adapter: ResolvedAdapter | None = None) -> dict[int, np.ndarray]: ...
 
     def sft_example(self, prompt: Prompt, action: str,
                     arguments: dict[str, Any]) -> tuple[list[int], list[int]]: ...

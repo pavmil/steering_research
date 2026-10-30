@@ -346,3 +346,30 @@ def test_patch_last_layer_reproduces_donor_logits(tiny_model):
     with ST.patched(m, last, PositionWindow(0, SEQ, "tool_content"), hd):
         got = _logits(m, b)
     assert torch.allclose(want, got, atol=1e-4), name
+
+
+def test_affine_hook_exact(tiny_model):
+    _, m = tiny_model
+    b = _inputs(m)
+    clean = _logits(m, b)
+    d = m.config.hidden_size
+    rng = np.random.default_rng(0)
+    U, P, a0 = rng.normal(size=(d, 2)) * 0.05, rng.normal(size=(2, d)), rng.normal(size=d)
+    L, w = 2, PositionWindow(SEQ - 1, SEQ, "action_point")
+    with ST.affine(m, L, w, U, P, a0, alpha=0.0) as h0:
+        z = _logits(m, b)
+    assert h0.n_applied == 1 and torch.allclose(clean, z, atol=1e-5)
+    h_base = _hidden(m, b, L)[SEQ - 1]
+    hook = ST.AffineHook(L, w, U, P, a0, alpha=0.7)
+    hook.attach(m)
+    try:
+        with ST.ActivationRecorder(m, [L]) as rec:
+            out = m(**b).logits.clone()
+    finally:
+        hook.detach()
+    want = h_base + 0.7 * (h_base @ U @ P + a0)
+    assert hook.n_applied == 1
+    assert np.allclose(rec.raw(L)[SEQ - 1], want, atol=1e-3)
+    assert torch.allclose(clean[:, : SEQ - 1], out[:, : SEQ - 1], atol=1e-5)
+    with pytest.raises(ValueError):
+        ST.AffineHook(L, w, U, P[:1], a0)

@@ -132,6 +132,24 @@ class TactCfg:
 
 
 @dataclass
+class ActCfg:
+    # Вмешательства в точке вызова (interventions.py): линейное в закрытой форме (с LoRA-учителем
+    # и без), LoReFT, CAST. Слои "auto" — доли глубины (на 28 слоях: 16, 18, 20, 22, 24, 26).
+    layers: list[int] | str = "auto"
+    layer_fracs: list[float] = field(default_factory=lambda: [0.57, 0.64, 0.71, 0.79, 0.86, 0.93])
+    ranks: list[int] = field(default_factory=lambda: [4, 8, 16])
+    alphas: list[float] = field(default_factory=lambda: [0.5, 1.0, 1.5])
+    n_pcs: int = 32
+    ridge: float = 10.0
+    reft_layer_fracs: list[float] = field(default_factory=lambda: [0.64, 0.79, 0.93])
+    reft_rank: int = 4
+    reft_lr: float = 2e-3
+    reft_epochs: int = 3
+    cast_behavior_fracs: list[float] = field(default_factory=lambda: [0.57, 0.71, 0.86])
+    cast_alphas: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+
+
+@dataclass
 class TransferCfg:
     # Разведка переноса (Experiment.transfer): методы, выбранные на val, на задачах с типами
     # требований, которых не было в train (unseen), и со знакомыми типами на свежем seed (seen).
@@ -167,6 +185,7 @@ class ExperimentConfig:
     lora: LoraCfg = field(default_factory=LoraCfg)
     gate: GateCfg = field(default_factory=GateCfg)
     tact: TactCfg = field(default_factory=TactCfg)
+    act: ActCfg = field(default_factory=ActCfg)
     transfer: TransferCfg = field(default_factory=TransferCfg)
     eval: EvalCfg = field(default_factory=EvalCfg)
 
@@ -262,7 +281,7 @@ def load_yaml(path: str | Path) -> ExperimentConfig:
 
 
 _SECTIONS = ("model", "data", "decision", "probe", "steer", "episode", "lora", "gate", "tact",
-             "transfer", "eval")
+             "act", "transfer", "eval")
 
 
 def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:

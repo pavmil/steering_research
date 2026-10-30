@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from .base import (Backend, Decision, Intervention, Prompt, ResolvedAdapter, ResolvedSteer,
-                   ResolvedTact, auto_layers)
+from .base import (Backend, Decision, Intervention, Prompt, ResolvedAdapter, ResolvedAffine,
+                   ResolvedSteer, ResolvedTact, auto_layers)
 from .mock import MockBackend
 
-__all__ = ["Backend", "Decision", "Intervention", "MockBackend", "Prompt", "ResolvedAdapter",
+__all__ = ["Backend", "Decision", "Intervention", "MockBackend", "Prompt", "ResolvedAdapter", "ResolvedAffine",
            "ResolvedSteer", "ResolvedTact", "auto_layers", "load_backend"]
 
 

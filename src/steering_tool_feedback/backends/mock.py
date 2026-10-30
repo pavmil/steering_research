@@ -28,7 +28,7 @@ import numpy as np
 from .. import simulator as S
 from ..store import sha
 from ..windows import PositionWindow
-from .base import Decision, Prompt, ResolvedSteer, ResolvedTact
+from .base import Decision, Prompt, ResolvedAffine, ResolvedSteer, ResolvedTact
 
 _WIN = {"tool_content": (100, 120), "field_read": (105, 108),
         "post_message": (116, 124), "pre_action": (124, 128), "action_point": (127, 128)}
@@ -94,6 +94,10 @@ class MockBackend:
     def _steer_effect(self, steer) -> tuple[float, float]:
         if steer is None:
             return 0.0, 0.0
+        if isinstance(steer, ResolvedAffine):
+            r = steer.U.shape[1] if hasattr(steer.U, "shape") else 1
+            good = self.gain * 0.7 * (1 - math.exp(-steer.alpha)) * min(1.0, r / 8)
+            return good, min(self.cost * 0.5 * steer.alpha, 0.9)
         if isinstance(steer, ResolvedTact):
             cos = float(np.mean([abs(float(ax.unit @ self._use[ax.layer])) * self._profile(ax.layer)
                                  for ax in steer.axes]))
@@ -161,7 +165,7 @@ class MockBackend:
         d = Decision(action=action, scores=scores, n_prompt_tokens=p.n_tokens,
                      n_new_tokens=4, n_model_calls=calls,
                      latency_ms=p.n_tokens * 0.05 * calls,
-                     hook_applied=len(steer.window) if steer else None,
+                     hook_applied=(len(steer.window) if getattr(steer, "window", None) else 1) if steer else None,
                      positions_source="mock" if steer else None)
         if isinstance(steer, ResolvedTact):
             d.hook_changed = len(steer.axes)
@@ -192,9 +196,29 @@ class MockBackend:
     def decide_restate(self, prompt, mode, temperature, trial):
         return self.decide_two_step(prompt, "restate", "go", 48, mode, temperature, trial)
 
+    def record_call_point(self, prompt, layers, adapter=None):
+        rec = self.record(prompt, layers, ["action_point"])
+        shift = 0.5 if adapter is not None else 0.0
+        return {L: rec[(L, "action_point")] + shift * self._use[L].astype(np.float32) for L in layers}
+
     # --- «обучение» адаптера --------------------------------------------
     def sft_example(self, prompt, action, arguments):
         return [len(prompt.key)], [len(action)]
+
+    def reft_example(self, prompt, action):
+        return [len(prompt.key)], [len(action)]
+
+    def train_reft(self, examples, layer, rank, lr, epochs, seed=0):
+        from ..interventions import AffineMap
+
+        self.calls["train"] += 1
+        rng = np.random.default_rng(seed + layer)
+        d = self.hidden_size
+        am = AffineMap((0.01 * rng.normal(size=(d, rank))).astype(np.float32),
+                       np.linalg.qr(rng.normal(size=(d, rank)))[0].T.astype(np.float32),
+                       np.zeros(d, np.float32), {"rank": rank, "layer": layer, "lr": lr, "epochs": epochs})
+        return am, {"train_seconds": 0.0, "epoch_losses": [], "n_trainable": 2 * rank * d + rank,
+                    "n_examples": len(examples)}
 
     def train_adapter(self, examples, lora_cfg, lr, epochs, out_dir):
         self.calls["train"] += 1

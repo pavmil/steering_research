@@ -373,3 +373,31 @@ def test_affine_hook_exact(tiny_model):
     assert torch.allclose(clean[:, : SEQ - 1], out[:, : SEQ - 1], atol=1e-5)
     with pytest.raises(ValueError):
         ST.AffineHook(L, w, U, P[:1], a0)
+
+
+def test_affine_stack_matches_sequential_hooks(tiny_model):
+    _, m = tiny_model
+    b = _inputs(m)
+    d = m.config.hidden_size
+    rng = np.random.default_rng(1)
+    w = PositionWindow(SEQ - 1, SEQ, "action_point")
+
+    class Part:
+        def __init__(self, layer, alpha):
+            self.layer, self.window, self.alpha = layer, w, alpha
+            self.U, self.P, self.a0 = rng.normal(size=(d, 2)) * 0.05, rng.normal(size=(2, d)), rng.normal(size=d)
+
+    parts = [Part(1, 0.5), Part(3, 0.3)]
+    with ST.affine_stack(m, parts) as g:
+        got = _logits(m, b)
+    assert g.n_applied == 1 and len(g.hooks) == 2
+    hooks = [ST.AffineHook(p.layer, w, p.U, p.P, p.a0, p.alpha) for p in parts]
+    for h in hooks:
+        h.attach(m)
+    try:
+        want = _logits(m, b)
+    finally:
+        for h in hooks:
+            h.detach()
+    assert torch.allclose(got, want, atol=1e-5)
+    assert not torch.allclose(got, _logits(m, b), atol=1e-4)

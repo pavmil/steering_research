@@ -9,6 +9,7 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from steering_tool_feedback import gates as G
@@ -613,6 +614,42 @@ def test_activation_methods_full_cycle_on_mock(root):
     assert be.calls == {"decide": 0, "record": 0, "train": 0}
 
 
+STACK_METHODS = ["baseline", "linmap", "linmap_prompt", "linmap_stack", "linmap_prompt_stack"]
+
+
+def test_prompt_teacher_and_stack_on_mock(root):
+    exp = _exp(root, **{"eval.methods": STACK_METHODS, "act.stack_alphas": [1.0, 2.0]})
+    exp.run("test")
+    fitted = exp.state["fitted"]
+    lp = fitted["linmap_prompt"]
+    assert lp["rows"] and lp["teacher"] == "explicit_state"
+    assert lp["teacher_train_success"] > lp["base_train_success"]   # mock: учитель-промпт лучше базы
+    for m in ("linmap_stack", "linmap_prompt_stack"):
+        rows = fitted[m]["rows"]
+        assert {r["alloc"] for r in rows} == {"uniform", "importance"} and len(rows) == 4, m
+        for r in rows:
+            assert np.isclose(sum(r["alphas"]), r["alpha"], atol=1e-6)
+            assert sum(r["ranks"]) <= exp.cfg.act.stack_rank * len(exp._act_layers()) + len(r["ranks"])
+        assert set(fitted[m]["importance"]) == set(exp._act_layers())
+    frozen = exp.state["frozen"]["methods"]
+    if "linmap_prompt_stack" in frozen:
+        assert len(frozen["linmap_prompt_stack"]["affine_ids"]) == len(frozen["linmap_prompt_stack"]["layers"])
+    assert set(frozen) <= set(exp.state["test"]["methods"]) | {"steering"}
+    # повтор — учитель-промпт и активации из кэша
+    be = MockBackend()
+    exp2 = _exp(root, backend=be, **{"eval.methods": STACK_METHODS, "act.stack_alphas": [1.0, 2.0],
+                                     "eval.reopen_test_reason": "повтор кэша"})
+    exp2.run("fit")
+    assert be.calls == {"decide": 0, "record": 0, "train": 0}
+
+
+def test_stack_needs_parent(root):
+    exp = _exp(root, **{"eval.methods": ["baseline", "linmap_stack"]})
+    exp.run("fit")
+    f = exp.state["fitted"]["linmap_stack"]
+    assert f["row"] is None and "linmap" in f["reason"]
+
+
 @pytest.mark.model
 def test_hf_affine_at_call_point_and_loreft(chatml_tokenizer):
     torch = pytest.importorskip("torch")
@@ -645,3 +682,32 @@ def test_hf_affine_at_call_point_and_loreft(chatml_tokenizer):
     assert np.allclose(am.P @ am.P.T, np.eye(2), atol=1e-4), "строки R ортонормированы"
     assert all(p.requires_grad for p in be.model.parameters())
     assert not torch.is_grad_enabled() or True
+
+
+@pytest.mark.model
+def test_hf_two_step_prompt_and_affine_stack(chatml_tokenizer):
+    pytest.importorskip("torch")
+    import numpy as np
+
+    from conftest import make_tiny_llama
+    from steering_tool_feedback.backends import ResolvedAffine, ResolvedAffineStack
+    from steering_tool_feedback.backends.hf import HFBackend
+    from steering_tool_feedback.methods import TWO_STEP
+
+    be = HFBackend(make_tiny_llama(vocab=len(chatml_tokenizer)), chatml_tokenizer, "tiny", "cpu")
+    t = next(t for t in S.build_pilot_set(30, seed=0) if t.pair_type == "changing")
+    p = be.prompt(t.prompt(1), t.essential_field(1), S.tools_schema())
+    ask, go, n = TWO_STEP["explicit_state"]
+    tp = be.two_step_prompt(p, ask, go, 4)
+    assert tp.messages[: len(p.messages)] == p.messages and tp.messages[-1]["content"] == go
+    assert tp.n_tokens > p.n_tokens
+    # двухшаговое решение идёт ровно через этот промпт
+    d2 = be.decide_two_step(p, ask, go, 4, "scored", 0.0, 0)
+    assert d2.scores == be.decide(tp, "scored", None, 0.0, 0).scores
+    d = be.hidden_size
+    rng = np.random.default_rng(0)
+    parts = tuple(ResolvedAffine(L, rng.normal(size=(d, 2)) * 0.1, rng.normal(size=(2, d)), rng.normal(size=d), a)
+                  for L, a in ((1, 0.5), (2, 0.5)))
+    base = be.decide(p, "scored", None, 0.0, 0).scores
+    on = be.decide(p, "scored", ResolvedAffineStack(parts), 0.0, 0, with_args=True, arg_tokens=4)
+    assert on.hook_applied == 1 and max(abs(base[k] - on.scores[k]) for k in base) > 1e-4

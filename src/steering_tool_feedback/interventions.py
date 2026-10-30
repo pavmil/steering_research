@@ -9,6 +9,10 @@
 linmap_lora — Δh = h_LoRA − h_база, подогнанный в закрытой форме (PCA → ridge → ранг r): LoRA как учитель.
 linmap      — без учителя: цель для неверного решения базы — центроид верных состояний с тем же
               правильным действием; для верного — ноль. Та же подгонка в закрытой форме.
+linmap_prompt — учитель-промпт: Δh = h(та же модель с промптом explicit_state) − h(база) там, где
+              учитель решил верно. Дистилляция контекста в активации без градиента.
+*_stack     — те же цели на нескольких слоях сразу; ранг и сила распределены по слоям на симплексе
+              (равномерно или по важности слоя — идея SimplexLoRA, 2610.37206).
 reft        — LoReFT (Wu et al., 2404.03592): h + Rᵀ(W h + b − R h), R с ортонормированными строками,
               обучается градиентом по CE имени верного действия; при выводе — та же аффинная форма.
 CAST        — Lee et al. (2409.05907): вектор условия (1-я главная компонента центрированного контраста
@@ -89,6 +93,42 @@ def contrast_targets(H: np.ndarray, correct: Sequence[bool], gold: Sequence[str]
     for i in np.where(~ok)[0]:
         D[i] = cent[g[i]] - H[i]
     return D
+
+
+def teacher_targets(H: np.ndarray, H_teacher: np.ndarray, teacher_ok: Sequence[bool]) -> np.ndarray:
+    """Цель от учителя-промпта: Δh = h(учитель) − h(база) там, где учитель решил верно; иначе ноль
+    (не переносить ошибки учителя). Учитель — та же модель с другим промптом, градиента нет."""
+    H = np.asarray(H, dtype=np.float64)
+    D = np.asarray(H_teacher, dtype=np.float64) - H
+    D[~np.asarray(teacher_ok, dtype=bool)] = 0.0
+    return D
+
+
+# --------------------------------------------------------------------------
+# Несколько слоёв: бюджет по важности (идея SimplexLoRA, 2610.37206)
+# --------------------------------------------------------------------------
+
+
+def simplex_weights(scores: Sequence[float]) -> np.ndarray:
+    """Доли слоёв на симплексе (ω ≥ 0, Σω = 1) пропорционально неотрицательной части важности.
+    Все нули — равномерно. В SimplexLoRA важность учится коротким прогревом; здесь она без
+    обучения (прирост одного слоя на val)."""
+    s = np.clip(np.asarray(scores, dtype=np.float64), 0.0, None)
+    if s.sum() <= 0:
+        return np.full(len(s), 1.0 / max(len(s), 1))
+    return s / s.sum()
+
+
+def allocate(weights: Sequence[float], rank_budget: int, alpha_total: float,
+             max_rank: int) -> list[tuple[int, int, float]]:
+    """Бюджет по слоям: ранг r_i = round(R·ω_i) (не больше max_rank), сила α_i = A·ω_i.
+    Возвращает (индекс, ранг, сила) для слоёв с ненулевым рангом; Σα по ним ≤ A."""
+    out = []
+    for i, w in enumerate(np.asarray(weights, dtype=np.float64)):
+        r = int(min(max_rank, round(rank_budget * w)))
+        if r > 0:
+            out.append((i, r, float(alpha_total * w)))
+    return out
 
 
 # --------------------------------------------------------------------------

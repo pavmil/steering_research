@@ -540,6 +540,20 @@ def affine(model: Any, layer: int, window: PositionWindow, U: Any, P: Any, a0: A
         hook.detach()
 
 
+@contextmanager
+def affine_stack(model: Any, parts: Sequence[Any]) -> Iterator["HookGroup"]:
+    """Аффинные поправки на нескольких слоях (части — с полями layer, window, U, P, a0, alpha).
+    Проверять group.n_applied == len(window): каждый слой отработал на всех позициях окна."""
+    hooks = [AffineHook(p.layer, p.window, p.U, p.P, p.a0, p.alpha) for p in parts]
+    for h in hooks:
+        h.attach(model)
+    try:
+        yield HookGroup(hooks)
+    finally:
+        for h in hooks:
+            h.detach()
+
+
 class HookGroup:
     """Несколько хуков одного вмешательства (TACT — по хуку на слой)."""
 

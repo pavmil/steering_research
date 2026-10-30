@@ -28,7 +28,7 @@ import numpy as np
 from .. import simulator as S
 from ..store import sha
 from ..windows import PositionWindow
-from .base import Decision, Prompt, ResolvedAffine, ResolvedSteer, ResolvedTact
+from .base import Decision, Prompt, ResolvedAffine, ResolvedAffineStack, ResolvedSteer, ResolvedTact
 
 _WIN = {"tool_content": (100, 120), "field_read": (105, 108),
         "post_message": (116, 124), "pre_action": (124, 128), "action_point": (127, 128)}
@@ -98,6 +98,12 @@ class MockBackend:
             r = steer.U.shape[1] if hasattr(steer.U, "shape") else 1
             good = self.gain * 0.7 * (1 - math.exp(-steer.alpha)) * min(1.0, r / 8)
             return good, min(self.cost * 0.5 * steer.alpha, 0.9)
+        if isinstance(steer, ResolvedAffineStack):
+            # Сумма по слоям: та же форма, что у одного слоя, с суммарной силой и лучшим рангом.
+            a = sum(p.alpha for p in steer.parts)
+            r = max(p.U.shape[1] for p in steer.parts)
+            good = self.gain * 0.75 * (1 - math.exp(-a)) * min(1.0, r / 8)
+            return good, min(self.cost * 0.45 * a, 0.9)
         if isinstance(steer, ResolvedTact):
             cos = float(np.mean([abs(float(ax.unit @ self._use[ax.layer])) * self._profile(ax.layer)
                                  for ax in steer.axes]))
@@ -181,6 +187,8 @@ class MockBackend:
         boost, harm = self._steer_effect(steer)
         if prompt.meta.get("variant") == "strong_prompt":
             boost += 0.12
+        if prompt.meta.get("variant") == "two_step":
+            boost += 0.24
         if adapter is not None:
             boost, harm = boost + 0.3, harm + 0.04
         return self._decision(prompt, self._decide(prompt, boost, harm, trial), steer=steer,
@@ -193,12 +201,19 @@ class MockBackend:
         return self._decision(prompt, self._decide(prompt, boost, 0.0, trial), calls=2,
                               with_args=with_args)
 
+    def two_step_prompt(self, prompt, ask, go, ask_tokens):
+        """Промпт второго шага: тот же ключ задачи, вариант — двухшаговый (учитель-промпт)."""
+        meta = {**prompt.meta, "variant": "two_step"}
+        return Prompt(key=sha([prompt.key, ask, go]), windows=dict(prompt.windows),
+                      n_tokens=prompt.n_tokens + 64, messages=prompt.messages, tools=prompt.tools,
+                      meta=meta)
+
     def decide_restate(self, prompt, mode, temperature, trial):
         return self.decide_two_step(prompt, "restate", "go", 48, mode, temperature, trial)
 
     def record_call_point(self, prompt, layers, adapter=None):
         rec = self.record(prompt, layers, ["action_point"])
-        shift = 0.5 if adapter is not None else 0.0
+        shift = 0.5 if adapter is not None else 0.3 if prompt.meta.get("variant") == "two_step" else 0.0
         return {L: rec[(L, "action_point")] + shift * self._use[L].astype(np.float32) for L in layers}
 
     # --- «обучение» адаптера --------------------------------------------

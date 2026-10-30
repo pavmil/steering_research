@@ -43,11 +43,11 @@ from . import metrics as M
 from . import probe as P
 from . import simulator as S
 from . import steering as ST
-from .backends import (Prompt, ResolvedAdapter, ResolvedAffine, ResolvedSteer, ResolvedTact,
-                       auto_layers, load_backend)
+from .backends import (Prompt, ResolvedAdapter, ResolvedAffine, ResolvedAffineStack, ResolvedSteer,
+                       ResolvedTact, auto_layers, load_backend)
 from .config import ExperimentConfig
-from .methods import (TWO_STEP, AdapterSpec, AffineSpec, CastSpec, GateSpec, MethodRun, SteerSpec,
-                      TactSpec, build_messages, get_method)
+from .methods import (TWO_STEP, AdapterSpec, AffineSpec, AffineStackSpec, CastSpec, GateSpec, MethodRun,
+                      SteerSpec, TactSpec, build_messages, get_method)
 from .store import ActivationCache, DecisionCache, Store, env_info, git_info, sha, write_jsonl
 from .windows import PositionWindow
 
@@ -104,6 +104,7 @@ class Experiment:
         self.axes_by_id: dict[str, list[ST.DriftAxis]] = {}
         self.affines_by_id: dict[str, Any] = {}
         self.cast_conds: dict[str, np.ndarray] = {}
+        self._targets: dict[str, dict[str, Any]] = {}   # цели linmap по виду учителя
         self._prompts: dict[tuple, Prompt] = {}
         self._dcache: DecisionCache | None = None
         self._acache: ActivationCache | None = None
@@ -284,7 +285,9 @@ class Experiment:
             self.flags.append("позиции хука взяты из счётчика, а не из модели — проверить окна")
         return {**out, "cached": cached}
 
-    def _resolve_affine(self, spec: AffineSpec) -> ResolvedAffine:
+    def _resolve_affine(self, spec: AffineSpec | AffineStackSpec) -> ResolvedAffine | ResolvedAffineStack:
+        if isinstance(spec, AffineStackSpec):
+            return ResolvedAffineStack(tuple(self._resolve_affine(p) for p in spec.parts))
         am = self.affines_by_id[spec.affine_id]
         return ResolvedAffine(spec.layer, am.U, am.P, am.a0, spec.alpha)
 
@@ -896,8 +899,7 @@ class Experiment:
         bs = self.state["summaries"]["val"]["baseline"]
         res: dict[str, Any] = {"rows": [], "row": None}
         for (L, r), am in maps.items():
-            aid = sha(np.concatenate([am.U.ravel(), am.P.ravel(), am.a0]).tobytes(), 12)
-            self.affines_by_id[aid] = am
+            aid = self._register_affine(am)
             for a in alphas:
                 spec = AffineSpec(aid, L, float(a))
                 recs = self.evaluate(name, "val", write=False, affine=spec, tag=f"{name} L{L}/r{r}/a{a}")
@@ -907,67 +909,195 @@ class Experiment:
         res["row"] = _select(res["rows"], self.cfg.steer.max_specificity_drop)
         if res["row"] is None:
             res["reason"] = "все конфигурации роняют специфичность сверх допуска"
+        self._save_affines(name, {r["affine_id"] for r in res["rows"]})
+        return res
+
+    def _register_affine(self, am: Any) -> str:
+        aid = sha(np.concatenate([am.U.ravel(), am.P.ravel(), am.a0]).tobytes(), 12)
+        self.affines_by_id[aid] = am
+        return aid
+
+    def _save_affines(self, name: str, ids: set[str]) -> None:
         adir = self.dir / "affine"
         adir.mkdir(exist_ok=True)
-        for aid in {r["affine_id"] for r in res["rows"]}:
+        for aid in ids:
             am = self.affines_by_id[aid]
             np.savez(adir / f"{name}_{aid}.npz", U=am.U, P=am.P, a0=am.a0)
+
+    def _seconds_per_prompt(self, tag: str, fn: Any, prompts: list[Prompt], k: int = 4) -> float:
+        """Цена без кэша (кэш активаций её прячет): среднее время fn на первых k промптах.
+        Замер хранится в кэше активаций первого промпта под ключом sec|tag — повтор его не гоняет."""
+        _, acache = self._caches()
+        key = f"sec|{tag}"
+        got = acache.load(prompts[0].key)
+        if key in got:
+            return float(got[key][0])
+        t0 = time.perf_counter()
+        for p in prompts[:k]:
+            fn(p)
+        per = (time.perf_counter() - t0) / max(1, min(k, len(prompts)))
+        acache.save(prompts[0].key, {key: np.array([per])})
+        return per
+
+    def _teacher_call_point(self, prompts: list[Prompt],
+                            layers: list[int]) -> tuple[list[dict[int, np.ndarray]], list[str]]:
+        """Учитель-промпт: двухшаговый вариант cfg.act.teacher на тех же промптах (жадно).
+        Кэш по ключу промпта базы: состояния учителя в точке вызова и его действие."""
+        _, acache = self._caches()
+        dc = self.cfg.decision
+        ask, go, n_ask = TWO_STEP[self.cfg.act.teacher]
+        tag = f"call_point@prompt:{sha([ask, go, n_ask, dc.mode, dc.temperature], 8)}"
+        acts, actions = [], []
+        for p in _progress(prompts, f"teacher {self.cfg.act.teacher}", len(prompts),
+                           disable=not self.verbose or len(prompts) < 4):
+            got = acache.load(p.key)
+            keys = {L: f"L{L}|{tag}" for L in layers}
+            ak = f"action|{tag}"
+            if not (ak in got and all(k in got for k in keys.values())):
+                tp = self.backend.two_step_prompt(p, ask, go, n_ask)
+                rec = self.backend.record_call_point(tp, layers)
+                d = self.backend.decide(tp, dc.mode, None, dc.temperature, 0)
+                acache.save(p.key, {**{keys[L]: v for L, v in rec.items()},
+                                    ak: np.array([S.ACTIONS.index(d.action)])})
+                got = acache.load(p.key)
+            acts.append({L: got[keys[L]] for L in layers})
+            actions.append(S.ACTIONS[int(got[ak][0])])
+        return acts, actions
+
+    def _linmap_targets(self, kind: str) -> dict[str, Any]:
+        """Цели подгонки в закрытой форме на одних и тех же промптах train (меняющие пары):
+        lora — Δh LoRA; contrast — центроид верных состояний базы (без учителя);
+        prompt — Δh учителя-промпта там, где он решил верно. {"reason"} — цели нет."""
+        from . import interventions as IV
+
+        if kind in self._targets:
+            return self._targets[kind]
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        prompts = [self._prompt(by[t], b) for t, b in keys]
+        layers = self._act_layers()
+        H = {L: np.stack([x[L] for x in self._call_point_acts(prompts, layers)]) for L in layers}
+        out: dict[str, Any] = {"layers": layers, "H": H, "n_examples": len(prompts)}
+        lk = ",".join(map(str, layers))
+        per = self._seconds_per_prompt(f"call_point:{lk}", lambda p: self.backend.record_call_point(p, layers),
+                                       prompts)
+        if kind == "lora":
+            specs = self._specs_for("lora")
+            if specs is None:
+                return {"reason": "LoRA не выбрана — нет учителя"}
+            ad = ResolvedAdapter(specs["adapter"].adapter_id, specs["adapter"].path)
+            hl = self._call_point_acts(prompts, layers, ad)
+            out["D"] = {L: np.stack([x[L] for x in hl]) - H[L] for L in layers}
+            out["teacher"] = specs["adapter"].adapter_id
+            per += self._seconds_per_prompt(f"call_point@{ad.adapter_id}:{lk}",
+                                            lambda p: self.backend.record_call_point(p, layers, ad), prompts)
+        elif kind == "contrast":
+            ok = self._train_ok(("changing",))
+            correct = [ok[k] for k in keys]
+            if all(correct) or not any(correct):
+                return {"reason": "нужны и верные, и неверные решения базы на train"}
+            gold = [sorted(by[t].branch(b).allowed_actions)[0] for t, b in keys]
+            out["D"] = {L: IV.contrast_targets(H[L], correct, gold) for L in layers}
+        elif kind == "prompt":
+            ht, actions = self._teacher_call_point(prompts, layers)
+            t_ok = [S.score_action(a, by[t].branch(b)) for a, (t, b) in zip(actions, keys)]
+            b_ok = self._train_ok(("changing",))
+            out["D"] = {L: IV.teacher_targets(H[L], np.stack([x[L] for x in ht]), t_ok) for L in layers}
+            out.update(teacher=self.cfg.act.teacher, teacher_train_success=float(np.mean(t_ok)),
+                       base_train_success=float(np.mean([b_ok[k] for k in keys])))
+            ask, go, n_ask = TWO_STEP[self.cfg.act.teacher]
+
+            def teach(p: Prompt) -> None:
+                tp = self.backend.two_step_prompt(p, ask, go, n_ask)
+                self.backend.record_call_point(tp, layers)
+                self.backend.decide(tp, self.cfg.decision.mode, None, self.cfg.decision.temperature, 0)
+
+            per += self._seconds_per_prompt(f"teacher:{self.cfg.act.teacher}:{lk}", teach, prompts)
+            self.log(f"учитель {self.cfg.act.teacher} на train: успех {out['teacher_train_success']:.3f} "
+                     f"(база {out['base_train_success']:.3f})")
+        else:
+            raise KeyError(kind)
+        out["acts_seconds"] = round(per * len(prompts), 1)
+        self._targets[kind] = out
+        return out
+
+    def _fit_linmap_family(self, name: str, kind: str) -> dict[str, Any]:
+        """Один слой: карта в закрытой форме для каждого (слой, ранг), сила — по сетке на val."""
+        from . import interventions as IV
+
+        t = self._linmap_targets(kind)
+        if "reason" in t:
+            return {"rows": [], "row": None, "reason": t["reason"]}
+        c = self.cfg.act
+        maps, t0 = {}, time.perf_counter()
+        for L in t["layers"]:
+            for r in c.ranks:
+                maps[(L, r)] = IV.fit_affine(t["H"][L], t["D"][L], r, c.n_pcs, c.ridge, self.cfg.data.seed)
+        cost = {"acts_seconds": t["acts_seconds"], "fit_seconds": round(time.perf_counter() - t0, 1),
+                "n_examples": t["n_examples"]}
+        res = self._fit_affine_grid(name, maps, c.alphas)
+        res["cost"] = cost
+        res.update({k: t[k] for k in ("teacher", "teacher_train_success", "base_train_success") if k in t})
         return res
 
     def _fit_linmap_lora(self) -> dict[str, Any]:
-        """Δh = h_LoRA − h_база в точке вызова, подогнанный в закрытой форме (LoRA — учитель)."""
-        from . import interventions as IV
-
-        specs = self._specs_for("lora")
-        if specs is None:
-            return {"rows": [], "row": None, "reason": "LoRA не выбрана — нет учителя"}
-        ad = ResolvedAdapter(specs["adapter"].adapter_id, specs["adapter"].path)
-        tasks, keys = self._train_changing()
-        by = {t.task_id: t for t in tasks}
-        prompts = [self._prompt(by[t], b) for t, b in keys]
-        layers, c = self._act_layers(), self.cfg.act
-        t0 = time.perf_counter()
-        hb, hl = self._call_point_acts(prompts, layers), self._call_point_acts(prompts, layers, ad)
-        t_acts = time.perf_counter() - t0
-        maps, t0 = {}, time.perf_counter()
-        for L in layers:
-            H = np.stack([x[L] for x in hb])
-            D = np.stack([x[L] for x in hl]) - H
-            for r in c.ranks:
-                maps[(L, r)] = IV.fit_affine(H, D, r, c.n_pcs, c.ridge, self.cfg.data.seed)
-        cost = {"acts_seconds": round(t_acts, 1), "fit_seconds": round(time.perf_counter() - t0, 1),
-                "n_examples": len(prompts)}
-        res = self._fit_affine_grid("linmap_lora", maps, c.alphas)
-        res.update(teacher=specs["adapter"].adapter_id, cost=cost)
-        return res
+        """Учитель — LoRA: цель Δh = h_LoRA − h_база."""
+        return self._fit_linmap_family("linmap_lora", "lora")
 
     def _fit_linmap(self) -> dict[str, Any]:
         """Без учителя: цель — центроид верных состояний базы с тем же правильным действием."""
+        return self._fit_linmap_family("linmap", "contrast")
+
+    def _fit_linmap_prompt(self) -> dict[str, Any]:
+        """Учитель — та же модель с двухшаговым промптом (cfg.act.teacher), без градиента."""
+        return self._fit_linmap_family("linmap_prompt", "prompt")
+
+    def _fit_stack(self, name: str, parent: str, kind: str) -> dict[str, Any]:
+        """Все слои сразу; бюджет ранга R = stack_rank × слоёв и сила A — по слоям на симплексе:
+        uniform — поровну; importance — по приросту лучшей одно-слойной конфигурации родителя на
+        val (идея SimplexLoRA: больше ресурса важным слоям; важность здесь без обучения)."""
         from . import interventions as IV
 
-        tasks, keys = self._train_changing()
-        by = {t.task_id: t for t in tasks}
-        ok = self._train_ok(("changing",))
-        prompts = [self._prompt(by[t], b) for t, b in keys]
-        correct = [ok[k] for k in keys]
-        gold = [sorted(by[t].branch(b).allowed_actions)[0] for t, b in keys]
-        if all(correct) or not any(correct):
-            return {"rows": [], "row": None, "reason": "нужны и верные, и неверные решения базы на train"}
-        layers, c = self._act_layers(), self.cfg.act
-        t0 = time.perf_counter()
-        hb = self._call_point_acts(prompts, layers)
-        t_acts = time.perf_counter() - t0
-        maps, t0 = {}, time.perf_counter()
-        for L in layers:
-            H = np.stack([x[L] for x in hb])
-            D = IV.contrast_targets(H, correct, gold)
-            for r in c.ranks:
-                maps[(L, r)] = IV.fit_affine(H, D, r, c.n_pcs, c.ridge, self.cfg.data.seed)
-        cost = {"acts_seconds": round(t_acts, 1), "fit_seconds": round(time.perf_counter() - t0, 1),
-                "n_examples": len(prompts)}
-        res = self._fit_affine_grid("linmap", maps, c.alphas)
-        res["cost"] = cost
+        f = (self.state.get("fitted") or {}).get(parent)
+        if not f or not f.get("rows"):
+            return {"rows": [], "row": None, "reason": f"нужен {parent} в eval.methods — важность слоёв"}
+        t = self._linmap_targets(kind)
+        c, layers = self.cfg.act, t["layers"]
+        base = self.state["records"]["val"]["baseline"]
+        bs = self.state["summaries"]["val"]["baseline"]
+        gain = [max([r["success"] for r in f["rows"] if r["layer"] == L], default=bs["success"]) - bs["success"]
+                for L in layers]
+        weights = {"uniform": IV.simplex_weights(np.ones(len(layers))), "importance": IV.simplex_weights(gain)}
+        res: dict[str, Any] = {"rows": [], "row": None, "importance": dict(zip(layers, gain))}
+        maps: dict[tuple[int, int], str] = {}
+        for alloc in c.stack_allocs:
+            w = weights[alloc]
+            for A in c.stack_alphas:
+                parts = []
+                for i, r, a in IV.allocate(w, c.stack_rank * len(layers), A, c.n_pcs):
+                    L = layers[i]
+                    if (L, r) not in maps:
+                        maps[(L, r)] = self._register_affine(
+                            IV.fit_affine(t["H"][L], t["D"][L], r, c.n_pcs, c.ridge, self.cfg.data.seed))
+                    parts.append((AffineSpec(maps[(L, r)], L, a), r))
+                spec = AffineStackSpec(tuple(p for p, _ in parts), alloc)
+                recs = self.evaluate(name, "val", write=False, affine=spec, tag=f"{name} {alloc}/A{A}")
+                res["rows"].append(self._row(self.summarize(recs, base), bs, alloc=alloc, alpha=float(A),
+                                             layers=[p.layer for p, _ in parts], ranks=[r for _, r in parts],
+                                             alphas=[p.alpha for p, _ in parts],
+                                             affine_ids=[p.affine_id for p, _ in parts],
+                                             weights=[round(float(x), 3) for x in w]))
+        res["row"] = _select(res["rows"], self.cfg.steer.max_specificity_drop)
+        if res["row"] is None:
+            res["reason"] = "все конфигурации роняют специфичность сверх допуска"
+        self._save_affines(name, set(maps.values()))
         return res
+
+    def _fit_linmap_stack(self) -> dict[str, Any]:
+        return self._fit_stack("linmap_stack", "linmap", "contrast")
+
+    def _fit_linmap_prompt_stack(self) -> dict[str, Any]:
+        return self._fit_stack("linmap_prompt_stack", "linmap_prompt", "prompt")
 
     def _fit_reft(self) -> dict[str, Any]:
         """LoReFT в точке вызова: обучается только вмешательство (градиентом), веса модели заморожены.
@@ -1069,8 +1199,11 @@ class Experiment:
             return {"tact": self._tact_spec(r)}
         if method == "lora":
             return {"adapter": AdapterSpec(r["adapter_id"], r["path"])}
-        if method in ("linmap_lora", "linmap", "reft"):
+        if method in ("linmap_lora", "linmap", "linmap_prompt", "reft"):
             return {"affine": AffineSpec(r["affine_id"], r["layer"], r["alpha"])}
+        if method in ("linmap_stack", "linmap_prompt_stack"):
+            return {"affine": AffineStackSpec(tuple(AffineSpec(i, L, a) for i, L, a in
+                                                    zip(r["affine_ids"], r["layers"], r["alphas"])), r["alloc"])}
         if method == "cast":
             return {"cast": CastSpec(r["cond_layer"], r["cond_id"], r["theta"], r["direction"],
                                      SteerSpec(r["layer"], "pre_action", r["alpha"], r["vector_id"], True))}
@@ -1080,7 +1213,8 @@ class Experiment:
         """Обучаемые конкуренты (train -> выбор на val) и сравнение всех методов на val."""
         self._need("sweep")
         fitted: dict[str, Any] = {}
-        order = sorted(self.cfg.eval.methods, key=lambda m: m != "lora")   # LoRA — раньше учеников
+        # LoRA — раньше учеников; *_stack — после одно-слойных (важность слоёв берётся из них)
+        order = sorted(self.cfg.eval.methods, key=lambda m: (m != "lora", m.endswith("_stack")))
         for m in order:
             if get_method(m).fitted:
                 self.state["fitted"] = fitted          # ученики (linmap_lora) видят выбранную LoRA
@@ -1373,6 +1507,9 @@ class Experiment:
                 continue
             keep = {"linmap_lora": ("affine_id", "layer", "rank", "alpha"),
                     "linmap": ("affine_id", "layer", "rank", "alpha"),
+                    "linmap_prompt": ("affine_id", "layer", "rank", "alpha"),
+                    "linmap_stack": ("affine_ids", "layers", "ranks", "alphas", "alloc", "alpha"),
+                    "linmap_prompt_stack": ("affine_ids", "layers", "ranks", "alphas", "alloc", "alpha"),
                     "reft": ("affine_id", "layer", "rank", "alpha"),
                     "cast": ("cond_layer", "cond_id", "theta", "direction", "layer", "vector_id", "alpha"),
                     "steering_gated": ("layer", "window", "alpha", "vector_id", "gate_id", "threshold"),
@@ -1399,10 +1536,15 @@ class Experiment:
         if "steering_gated" in methods:
             g = self.gates_by_id[methods["steering_gated"]["gate_id"]]
             np.savez(fdir / f"{fid}_gate.npz", **{k: np.asarray(x) for k, x in g.items()})
-        for m in ("linmap_lora", "linmap", "reft"):
+        for m in ("linmap_lora", "linmap", "linmap_prompt", "reft"):
             if m in methods:
                 am = self.affines_by_id[methods[m]["affine_id"]]
                 np.savez(fdir / f"{fid}_{m}.npz", U=am.U, P=am.P, a0=am.a0)
+        for m in ("linmap_stack", "linmap_prompt_stack"):
+            if m in methods:
+                for aid, L in zip(methods[m]["affine_ids"], methods[m]["layers"]):
+                    am = self.affines_by_id[aid]
+                    np.savez(fdir / f"{fid}_{m}_L{L}.npz", U=am.U, P=am.P, a0=am.a0)
         if "cast" in methods:
             np.savez(fdir / f"{fid}_cast.npz", cond=self.cast_conds[methods["cast"]["cond_id"]],
                      behavior=self.vectors_by_id[methods["cast"]["vector_id"]].vector)

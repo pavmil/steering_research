@@ -21,6 +21,7 @@ cp notebooks/00_TEMPLATE.ipynb notebooks/05_my_idea.ipynb
 | `06_transfer` | разведка: перенос выбранных на val методов на новые типы требований (`exp.transfer()`) |
 | `07_lora_diagnostics` | диагностика LoRA как маркера: подстановка LoRA → база по слоям и позициям, форма Δh (`exp.lora_diagnostics()`) |
 | `08_activation_methods` | вмешательства в точке вызова: `linmap_lora`, `linmap`, `reft`, `cast` против LoRA; val + новый перенос |
+| `09_prompt_teacher` | `linmap_prompt` (учитель — промпт explicit_state) и `*_stack` (несколько слоёв, бюджет по важности, SimplexLoRA); свежий перенос seed 303 |
 | `04_h3_steering` | H3 + сравнение со всеми методами (промпт, пересказ, явное состояние, гейт, TACT, LoRA), sham-контроли, эпизоды; test один раз |
 | `00_TEMPLATE` | заготовка для всего остального |
 
@@ -79,6 +80,8 @@ cp notebooks/00_TEMPLATE.ipynb notebooks/05_my_idea.ipynb
 | `lora` | LoRA r=8 на q/k/v/o, SFT на верный вызов; адаптер включается только на время решения | те же меняющие пары train, (lr, эпохи) — val |
 | `linmap_lora` | аффинная поправка `h + α·(h·U·P + a0)` в точке вызова, подогнанная в закрытой форме к Δh LoRA | Δh на train (LoRA — учитель), (слой, ранг, α) — val |
 | `linmap` | то же без учителя: цель — центроид верных состояний базы с тем же правильным действием | train, (слой, ранг, α) — val; без градиентов |
+| `linmap_prompt` | то же, цель — Δh = h(та же модель с промптом `act.teacher`) − h(база) там, где учитель решил верно | train (генерация учителя кэшируется), (слой, ранг, α) — val; без градиентов |
+| `linmap_stack`, `linmap_prompt_stack` | цели `linmap` / `linmap_prompt` на всех слоях `act.layers` сразу; ранг R = `stack_rank`×слоёв и сила A по слоям на симплексе: `uniform` или `importance` (прирост одного слоя на val) | нужен одно-слойный родитель в `eval.methods`; (распределение, A) — val |
 | `reft` | LoReFT `h + Rᵀ(Wh + b − Rh)` в точке вызова (2404.03592); обучается только вмешательство | train (CE имени действия), слой — val |
 | `cast` | CAST (2409.05907): условие PC1 «не подходит / подходит» + порог по F1, вектор поведения PC1 | условие — train (F1), (слой, α) поведения — val |
 

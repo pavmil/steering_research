@@ -55,6 +55,18 @@ class ResolvedAffine:
 
 
 @dataclass
+class ResolvedAffineStack:
+    """Аффинные поправки на нескольких слоях сразу, в одной позиции (точке вызова): бюджет
+    вмешательства распределён по слоям (идея SimplexLoRA, JOURNAL 2026-10-31)."""
+
+    parts: tuple[ResolvedAffine, ...]
+
+    @property
+    def window(self) -> PositionWindow | None:
+        return self.parts[0].window
+
+
+@dataclass
 class ResolvedAdapter:
     """LoRA-адаптер: включается только на время решения, база не меняется."""
 
@@ -62,7 +74,7 @@ class ResolvedAdapter:
     path: str
 
 
-Intervention = ResolvedSteer | ResolvedTact | ResolvedAffine
+Intervention = ResolvedSteer | ResolvedTact | ResolvedAffine | ResolvedAffineStack
 
 
 @dataclass
@@ -98,6 +110,8 @@ class Backend(Protocol):
     def decide_two_step(self, prompt: Prompt, ask: str, go: str, ask_tokens: int, mode: str,
                         temperature: float, trial: int, adapter: ResolvedAdapter | None = None,
                         with_args: bool = False, arg_tokens: int = 40) -> Decision: ...
+
+    def two_step_prompt(self, prompt: Prompt, ask: str, go: str, ask_tokens: int) -> Prompt: ...
 
     def record(self, prompt: Prompt, layers: list[int],
                windows: list[str]) -> dict[tuple[int, str], np.ndarray]: ...

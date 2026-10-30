@@ -45,8 +45,8 @@ from ..actions import (ActionFormat, detect_action_format, name_tokens, parse_ac
 from ..simulator import ACTIONS, tool_call_message  # noqa: E402
 from ..store import sha  # noqa: E402
 from ..windows import prepare_prompt  # noqa: E402
-from .base import (Decision, Prompt, ResolvedAdapter, ResolvedAffine, ResolvedSteer,  # noqa: E402
-                   ResolvedTact)
+from .base import (Decision, Prompt, ResolvedAdapter, ResolvedAffine, ResolvedAffineStack,  # noqa: E402
+                   ResolvedSteer, ResolvedTact)
 
 
 def pick_device(pref: str = "auto") -> str:
@@ -170,6 +170,8 @@ class HFBackend:
             return ST.drift_clamp(self.model, steer.axes, steer.window, steer.k, steer.lam)
         if isinstance(steer, ResolvedAffine):
             return ST.affine(self.model, steer.layer, steer.window, steer.U, steer.P, steer.a0, steer.alpha)
+        if isinstance(steer, ResolvedAffineStack):
+            return ST.affine_stack(self.model, steer.parts)
         return ST.steering(self.model, steer.vector,
                            ST.SteerConfig(alpha=steer.alpha, window=steer.window,
                                           normalize=steer.normalize))
@@ -343,13 +345,16 @@ class HFBackend:
     def _bind(self, steer, ids: list[int], mode: str):
         """Аффинное вмешательство без окна — в точку вызова: последний токен промпта + префикса
         вызова (scored) или последний токен промпта (generate: префикс пишет сама модель)."""
-        if isinstance(steer, ResolvedAffine) and steer.window is None:
+        if isinstance(steer, (ResolvedAffine, ResolvedAffineStack)) and steer.window is None:
             import dataclasses
 
             from ..windows import PositionWindow
 
             i = len(ids) + (len(self._prefix_ids()) if mode == "scored" else 0) - 1
-            return dataclasses.replace(steer, window=PositionWindow(i, i + 1, "action_point"))
+            w = PositionWindow(i, i + 1, "action_point")
+            if isinstance(steer, ResolvedAffineStack):
+                return ResolvedAffineStack(tuple(dataclasses.replace(p, window=w) for p in steer.parts))
+            return dataclasses.replace(steer, window=w)
         return steer
 
     def record_call_point(self, prompt, layers, adapter=None) -> dict[int, np.ndarray]:
@@ -396,6 +401,18 @@ class HFBackend:
         """Модель сначала пишет текст по просьбе ask (пересказ ответа, явное состояние),
         затем по просьбе go выбирает действие. Два вызова модели — учитывать в цене."""
         t0 = time.perf_counter()
+        sub, (clean, n1, n_ask_prompt) = self._two_step(prompt, ask, go, ask_tokens, adapter)
+        d = self.decide(sub, mode, None, temperature, trial, adapter, with_args, arg_tokens)
+        d.n_prompt_tokens += n_ask_prompt
+        d.n_new_tokens += n1
+        d.n_model_calls += 1
+        d.text = f"[note] {clean}\n" + (d.text or "")
+        d.latency_ms = (time.perf_counter() - t0) * 1000
+        return d
+
+    def _two_step(self, prompt, ask, go, ask_tokens, adapter=None) -> tuple[Prompt, tuple[str, int, int]]:
+        """Первый шаг двухшагового метода: модель жадно пишет текст по просьбе ask; возвращает
+        промпт второго шага (… + текст + go) и (текст, его длина, длина промпта первого шага)."""
         ask_msgs = prompt.messages + [{"role": "user", "content": ask}]
         p1 = prepare_prompt(self.tok, ask_msgs, tools=prompt.tools, locate=False,
                             template_kwargs=self.template_kwargs)
@@ -411,14 +428,12 @@ class HFBackend:
         p2 = prepare_prompt(self.tok, msgs, tools=prompt.tools, locate=False,
                             template_kwargs=self.template_kwargs)
         sub = Prompt(key=sha(p2.input_ids), windows={}, n_tokens=len(p2.input_ids),
-                     messages=msgs, tools=prompt.tools, prepared=p2)
-        d = self.decide(sub, mode, None, temperature, trial, adapter, with_args, arg_tokens)
-        d.n_prompt_tokens += len(p1.input_ids)
-        d.n_new_tokens += n1
-        d.n_model_calls += 1
-        d.text = f"[note] {clean}\n" + (d.text or "")
-        d.latency_ms = (time.perf_counter() - t0) * 1000
-        return d
+                     messages=msgs, tools=prompt.tools, prepared=p2, meta=dict(prompt.meta))
+        return sub, (clean, n1, len(p1.input_ids))
+
+    def two_step_prompt(self, prompt, ask, go, ask_tokens) -> Prompt:
+        """Промпт, на котором двухшаговый метод выбирает действие (учитель-промпт для linmap_prompt)."""
+        return self._two_step(prompt, ask, go, ask_tokens)[0]
 
     def decide_restate(self, prompt, mode, temperature, trial) -> Decision:
         from ..methods import RESTATE_ASK, RESTATE_GO

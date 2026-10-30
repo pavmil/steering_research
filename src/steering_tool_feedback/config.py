@@ -147,6 +147,13 @@ class ActCfg:
     reft_epochs: int = 3
     cast_behavior_fracs: list[float] = field(default_factory=lambda: [0.57, 0.71, 0.86])
     cast_alphas: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+    # linmap_prompt: учитель — та же модель с двухшаговым промптом (methods.TWO_STEP).
+    teacher: str = "explicit_state"
+    # *_stack: все слои layers сразу; бюджет ранга R = stack_rank × число слоёв и сила A — по слоям
+    # на симплексе: uniform (поровну) или importance (по приросту одного слоя на val, SimplexLoRA).
+    stack_allocs: list[str] = field(default_factory=lambda: ["uniform", "importance"])
+    stack_alphas: list[float] = field(default_factory=lambda: [1.0, 1.5, 2.0, 3.0])
+    stack_rank: int = 8
 
 
 @dataclass

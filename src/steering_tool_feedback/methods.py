@@ -15,6 +15,9 @@
 | tact             | адаптация       | TACT-Gate: оттягивание вдоль оси «сбой» в точке действия |
 | linmap_lora      | 07 → методы     | аффинная поправка в точке вызова, подогнанная в закрытой форме к Δh LoRA (учитель) |
 | linmap           | 07 → методы     | то же без учителя: цель — центроид верных состояний базы с тем же правильным действием |
+| linmap_prompt    | 08 → методы     | то же, учитель — та же модель с промптом explicit_state (без градиента) |
+| linmap_stack     | SimplexLoRA     | linmap на нескольких слоях, ранг и сила распределены по важности слоя |
+| linmap_prompt_stack | SimplexLoRA  | linmap_prompt на нескольких слоях, так же                     |
 | reft             | 2404.03592      | LoReFT в точке вызова: обучение градиентом только вмешательства, веса модели заморожены |
 | cast             | 2409.05907      | CAST: условие (PC1 «не подходит / подходит», порог по F1) включает вектор поведения |
 | sham:*           | контроли H3     | случайное/переставленное направление, соседний слой, окно до ответа |
@@ -92,6 +95,14 @@ METHODS: dict[str, MethodSpec] = {
                               note="Аффинная поправка в точке вызова, Δh LoRA в закрытой форме."),
     "linmap": MethodSpec("linmap", "baseline", affine=True, fitted=True,
                          note="Аффинная поправка в точке вызова без учителя, в закрытой форме."),
+    "linmap_prompt": MethodSpec("linmap_prompt", "baseline", affine=True, fitted=True,
+                                note="Аффинная поправка в точке вызова; учитель — та же модель с "
+                                     "промптом explicit_state (дистилляция контекста, без градиента)."),
+    "linmap_stack": MethodSpec("linmap_stack", "baseline", affine=True, fitted=True,
+                               note="linmap на нескольких слоях; бюджет ранга и силы — по слоям на "
+                                    "симплексе (равномерно / по важности слоя на val)."),
+    "linmap_prompt_stack": MethodSpec("linmap_prompt_stack", "baseline", affine=True, fitted=True,
+                                      note="linmap_prompt на нескольких слоях, бюджет как у linmap_stack."),
     "reft": MethodSpec("reft", "baseline", affine=True, fitted=True,
                        note="LoReFT в точке вызова (2404.03592), веса модели заморожены."),
     "cast": MethodSpec("cast", "baseline", cast=True, fitted=True,
@@ -194,6 +205,17 @@ class AffineSpec:
 
 
 @dataclass
+class AffineStackSpec:
+    """*_stack: аффинные карты на нескольких слоях сразу; alloc — как распределён бюджет."""
+
+    parts: tuple[AffineSpec, ...]
+    alloc: str = "uniform"
+
+    def fingerprint(self) -> str:
+        return sha(["affine_stack", [p.fingerprint() for p in self.parts]], 12)
+
+
+@dataclass
 class CastSpec:
     """cast: условие (вектор cond_id на слое cond_layer, порог, направление) + вектор поведения."""
 
@@ -218,7 +240,7 @@ class MethodRun:
     gate: GateSpec | None = None
     tact: TactSpec | None = None
     adapter: AdapterSpec | None = None
-    affine: AffineSpec | None = None
+    affine: AffineSpec | AffineStackSpec | None = None
     cast: CastSpec | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 

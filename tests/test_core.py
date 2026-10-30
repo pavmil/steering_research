@@ -416,6 +416,25 @@ def test_contrast_targets():
         IV.contrast_targets(H, [False] * 4, gold)
 
 
+def test_teacher_targets_and_simplex_allocation():
+    from steering_tool_feedback import interventions as IV
+
+    H = np.arange(12, dtype=float).reshape(4, 3)
+    T = H + 1.0
+    D = IV.teacher_targets(H, T, [True, False, True, False])
+    assert np.allclose(D[[0, 2]], 1.0) and np.allclose(D[[1, 3]], 0.0)
+    # доли на симплексе: отрицательная важность → 0, сумма 1; все нули → поровну
+    w = IV.simplex_weights([0.2, -0.1, 0.6, 0.0])
+    assert np.isclose(w.sum(), 1.0) and w[1] == 0 and w[3] == 0 and np.isclose(w[2], 0.75)
+    assert np.allclose(IV.simplex_weights([0, 0, 0]), 1 / 3)
+    parts = IV.allocate(w, rank_budget=16, alpha_total=2.0, max_rank=8)
+    assert [i for i, _, _ in parts] == [0, 2]                  # слои без ранга выпадают
+    assert parts[1][1] == 8                                    # потолок ранга
+    assert np.isclose(sum(a for _, _, a in parts), 2.0)
+    u = IV.allocate(IV.simplex_weights([1, 1, 1, 1]), 32, 1.0, 32)
+    assert [r for _, r, _ in u] == [8] * 4 and np.allclose([a for _, _, a in u], 0.25)
+
+
 def test_cast_pieces():
     from steering_tool_feedback import interventions as IV
 

@@ -23,7 +23,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
-PairType = Literal["changing", "invariant", "stress"]
+PairType = Literal["changing", "invariant", "stress", "global", "control"]
+
+# Целевые пары (на них учатся обучаемые методы; чувствительность / принятие правила) и
+# охранные (специфичность / сохранность). changing/invariant — условный срез (v2, v3);
+# global/control — глобальный срез (g1, H4′). Один набор задач содержит только одно семейство.
+TARGET_TYPES = ("changing", "global")
+GUARD_TYPES = ("invariant", "control")
+MAIN_TYPES = TARGET_TYPES + GUARD_TYPES
 
 # Канонические типы действий агента.
 ACTIONS = (
@@ -163,6 +170,20 @@ class PairedTask:
                 raise ValueError(
                     f"{self.task_id}: invariant pair must differ in SURFACE form, "
                     "otherwise it tests nothing"
+                )
+        elif self.pair_type == "global":
+            if a0 != a1:
+                raise ValueError(
+                    f"{self.task_id}: global pair must share A* (the change does not depend "
+                    f"on the tool result), got {sorted(a0)} vs {sorted(a1)}"
+                )
+            if self.world_0.observation() == self.world_1.observation():
+                raise ValueError(f"{self.task_id}: global pair branches must differ in the tool result")
+        elif self.pair_type == "control":
+            if a0 != a1 and (a0 & a1):
+                raise ValueError(
+                    f"{self.task_id}: control pair A* must be equal or disjoint, "
+                    f"got {sorted(a0)} vs {sorted(a1)}"
                 )
 
         if self.pair_type != "stress":
@@ -1008,8 +1029,12 @@ def _t_task(tid: str, g: _V3Rng, kind: str, explicit: bool, late: bool, invarian
 
 
 def build_transfer_set(n_tasks: int = 80, seed: int = 101, seen: tuple[str, ...] = TRANSFER_SEEN,
-                       unseen: tuple[str, ...] = TRANSFER_UNSEEN) -> dict[str, list[PairedTask]]:
-    """{"seen": задачи знакомых типов, "unseen": новых}, поровну; 70% меняющих, 30% инвариантных."""
+                       unseen: tuple[str, ...] = TRANSFER_UNSEEN,
+                       family: str = "v3") -> dict[str, list[PairedTask]]:
+    """{"seen": задачи знакомых типов, "unseen": новых}, поровну; 70% целевых, 30% охранных.
+
+    family — семейство задач, как у генератора данных: v2/v3 — условный срез (меняющие и
+    инвариантные пары), g1 — глобальный (global и control, H4′)."""
     for k in (*seen, *unseen):
         if k not in _T_KEY:
             raise ValueError(f"unknown requirement kind {k!r}")
@@ -1025,14 +1050,135 @@ def build_transfer_set(n_tasks: int = 80, seed: int = 101, seen: tuple[str, ...]
         i += 1
         group = "seen" if len(out["seen"]) <= len(out["unseen"]) else "unseen"
         kind = rng.choice(seen if group == "seen" else unseen)
-        t = _t_task(f"x{i:04d}", g, kind, rng.random() < 0.5, rng.random() >= 0.7,
-                    invariant=rng.random() >= 0.7)
+        if family == "g1":
+            u = rng.random()
+            t = _g1_task(f"x{i:04d}", g, kind, None if u < 0.7 else ("answer" if u < 0.88 else "form"))
+        else:
+            t = _t_task(f"x{i:04d}", g, kind, rng.random() < 0.5, rng.random() >= 0.7,
+                        invariant=rng.random() >= 0.7)
         sig = signature(t)
         if sig in sigs:
             continue
         sigs.add(sig)
         out[group].append(t)
     return out
+
+
+# --------------------------------------------------------------------------
+# Глобальный срез (H4′): генератор g1
+# --------------------------------------------------------------------------
+#
+# docs/HYPOTHESES.md H4′, docs/METRICS.md «Глобальный срез». Магазин, запросы и ответы check_stock те
+# же, что в v3, но правильное действие после проверки наличия одно при любом ответе: сначала спросить
+# пользователя (ask_user). Правило в промпте агента не написано (неявная инструкция магазина) — его
+# выучивают из данных, как глобальное изменение поведения. Контрольные пары — то же место диалога,
+# когда правило уже выполнено: агент спросил, пользователь ответил (ответ — результат вызова ask_user);
+# правильное действие зависит от ответа, спросить снова — ошибка. Позиция только ранняя: в истории
+# нет примеров правила.
+
+GLOBAL_ACTION = "ask_user"
+# Правило словами — для метода policy_prompt и учителя linmap_prompt на глобальном срезе.
+G1_POLICY = ("Store policy: after every stock check, first ask the user how they want to proceed "
+             "before ordering or searching for an alternative. Once the user has answered, act on "
+             "their answer without asking again.")
+_G1_ASK = {
+    True: ["The {item} meets your request. Should I place the order?",
+           "I checked the {item} and it fits what you asked for. Shall I order it?"],
+    False: ["The {item} does not meet your request. Should I search for an alternative?",
+            "I checked the {item} and it does not fit what you asked for. Shall I look for another one?"],
+}
+_G1_YES = {
+    True: ["Yes, please place the order.", "Yes, go ahead and order it.", "Sure, order it.",
+           "Please do, order it now."],
+    False: ["Yes, please find an alternative.", "Yes, search for another one.",
+            "Sure, look for something else.", "Please do, find me a different one."],
+}
+_G1_NO_ORDER = ["No, please find me a different one instead.", "No - look for an alternative instead.",
+                "Don't order it; search for another option."]
+
+
+def g1_arguments(task: PairedTask, branch: int) -> dict[str, Any]:
+    """Аргументы правильного вызова ask_user на global-паре (примеры SFT): вопрос по смыслу ответа."""
+    item = task.tool_call["arguments"]["item"]
+    return {"question": _G1_ASK[not task.branch(branch).state["negative"]][0].format(item=item)}
+
+
+def _g1_answer_world(wid: str, answer: str, act: str, need: dict[str, Any], negative: bool) -> World:
+    return World(
+        world_id=wid,
+        state={"need": dict(need), "negative": negative, "answer": answer},
+        result=ToolResult("ask_user", {"answer": answer}),
+        allowed_actions=frozenset({act}),
+        essential_key="answer",
+    )
+
+
+def _g1_task(tid: str, g: _V3Rng, kind: str, control: str | None) -> PairedTask:
+    """control=None — global-пара (ask_user в обеих ветках); "answer" — пользователь ответил
+    «да, заказывай» / «нет, найди другой»; "form" — две формулировки одного ответа."""
+    r = g.r
+    item = r.choice(_ITEMS)
+    need = _t_need(g, kind)
+    hist = _t_history(g, kind, need, item, item, late=False)
+    common = dict(task_id=tid, instruction=_BASE_INSTRUCTION_IMPLICIT, condition_explicit=False,
+                  critical_step_position="early")
+    if control is None:
+        pre = r.sample(_ALT_PREFIXES, 2)
+        alts = [(f"{pre[0]} {item}", _t_attrs(g, kind, need, True))]
+        if r.random() < 0.5:
+            alts.insert(0, (f"{pre[1]} {item}", _t_attrs(g, kind, need, False)))
+        neg = ["ask_user", "search_alternative"]
+        w0 = _t_world(f"{tid}/meets", item, _t_attrs(g, kind, need, True), kind, need, alts, True, neg)
+        w1 = _t_world(f"{tid}/fails", item, _t_attrs(g, kind, need, False), kind, need, alts, False, neg)
+        for w in (w0, w1):
+            w.allowed_actions = frozenset({GLOBAL_ACTION})
+        return PairedTask(pair_type="global", history=hist,
+                          tool_call={"tool": "check_stock", "arguments": {"item": item}},
+                          world_0=w0, world_1=w1, notes=f"g1 global need={kind}", **common)
+    ok = control == "answer" or r.random() < 0.5
+    a = _t_attrs(g, kind, need, ok)
+    hist = hist + [tool_call_message("check_stock", {"item": item}),
+                   tool_message(ToolResult("check_stock", _t_payload(item, a)))]
+    call = {"tool": "ask_user", "arguments": {"question": r.choice(_G1_ASK[ok]).format(item=item)}}
+    if control == "answer":
+        w0 = _g1_answer_world(f"{tid}/yes", r.choice(_G1_YES[True]), "place_order", need, False)
+        w1 = _g1_answer_world(f"{tid}/no", r.choice(_G1_NO_ORDER), "search_alternative", need, True)
+    else:
+        y0, y1 = r.sample(_G1_YES[ok], 2)
+        act = "place_order" if ok else "search_alternative"
+        w0 = _g1_answer_world(f"{tid}/a", y0, act, need, not ok)
+        w1 = _g1_answer_world(f"{tid}/b", y1, act, need, not ok)
+    return PairedTask(pair_type="control", history=hist, tool_call=call, world_0=w0, world_1=w1,
+                      notes=f"g1 control={control} need={kind}", **common)
+
+
+def _build_g1(n_tasks: int, seed: int) -> list[PairedTask]:
+    """g1: глобальный срез — ровно 70% global-пар и 30% контрольных (18% «да / нет», 12% формулировки;
+    доли точные, чтобы бюджет обучения не зависел от случая); типы требований «нет / срок /
+    количество / бюджет» поровну."""
+    rng = random.Random(seed)
+    g = _V3Rng(rng)
+    n_glob, n_ans = round(0.7 * n_tasks), round(0.18 * n_tasks)
+    roles: list[str | None] = [None] * n_glob + ["answer"] * n_ans + ["form"] * (n_tasks - n_glob - n_ans)
+    rng.shuffle(roles)
+    tasks: list[PairedTask] = []
+    seen: set[str] = set()
+    i = attempts = 0
+    while len(tasks) < n_tasks:
+        attempts += 1
+        if attempts > n_tasks * 50:
+            raise ValueError(f"cannot generate {n_tasks} distinct tasks; add templates")
+        i += 1
+        t = _g1_task(f"g{i:04d}", g, rng.choice(_NEEDS), roles[len(tasks)])
+        sig = signature(t)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        tasks.append(t)
+    return tasks
+
+
+GENERATORS["g1"] = _build_g1
 
 
 # --------------------------------------------------------------------------
@@ -1044,18 +1190,22 @@ def split_tasks(
     tasks: list[PairedTask],
     ratios: tuple[float, float, float] = (0.5, 0.2, 0.3),
     seed: int = 0,
+    stratify_pair_type: bool = False,
 ) -> dict[str, list[PairedTask]]:
     """Делим по ИСХОДНОЙ ЗАДАЧЕ и домену, а не по эпизодам.
 
     Обе ветки и все переформулировки одной задачи остаются в одном split —
     иначе происходит утечка и test перестаёт быть held-out.
+    stratify_pair_type — делить отдельно внутри каждого типа пары (g1: иначе в val может
+    оказаться пять контрольных пар). По умолчанию выключено: разбиения v2/v3 не меняются.
     """
     if abs(sum(ratios) - 1.0) > 1e-9:
         raise ValueError("ratios must sum to 1")
 
-    by_domain: dict[str, list[PairedTask]] = {}
+    by_domain: dict[tuple[str, ...], list[PairedTask]] = {}
     for t in tasks:
-        by_domain.setdefault(t.domain, []).append(t)
+        key = (t.domain, t.pair_type) if stratify_pair_type else (t.domain,)
+        by_domain.setdefault(key, []).append(t)
 
     out: dict[str, list[PairedTask]] = {"train": [], "val": [], "test": []}
     rng = random.Random(seed)
@@ -1116,13 +1266,13 @@ def audit(tasks: list[PairedTask]) -> AuditReport:
         except ValueError as e:
             problems.append(str(e))
 
-    n_changing = by_type.get("changing", 0)
-    n_invariant = by_type.get("invariant", 0)
+    n_changing = sum(by_type.get(k, 0) for k in TARGET_TYPES)
+    n_invariant = sum(by_type.get(k, 0) for k in GUARD_TYPES)
     if n_invariant == 0:
-        problems.append("no invariant pairs: specificity cannot be computed")
+        problems.append("no invariant/control pairs: specificity cannot be computed")
     elif n_changing and n_invariant < 0.15 * n_changing:
         problems.append(
-            f"too few invariant pairs ({n_invariant}) vs changing ({n_changing}); "
+            f"too few invariant/control pairs ({n_invariant}) vs target ({n_changing}); "
             "specificity estimate will be noisy"
         )
 

@@ -318,7 +318,7 @@ class Experiment:
                 "ok": S.score_action(out["action"], w), "allowed": sorted(w.allowed_actions),
                 "split": split, "method": mr.spec.name}
 
-    def _tasks(self, split: str, kinds=("changing", "invariant", "stress")) -> list[S.PairedTask]:
+    def _tasks(self, split: str, kinds=(*M.MAIN_TYPES, "stress")) -> list[S.PairedTask]:
         self._need("data")
         return [t for t in self.state["splits"][split] if t.pair_type in kinds]
 
@@ -428,7 +428,7 @@ class Experiment:
     # сводка по методу
     # ------------------------------------------------------------------
     def summarize(self, recs: list[dict], base: list[dict] | None = None) -> dict[str, Any]:
-        main = [r for r in recs if r["pair_type"] in ("changing", "invariant")]
+        main = [r for r in recs if r["pair_type"] in M.MAIN_TYPES]
         stress = [r for r in recs if r["pair_type"] == "stress"]
         by_pair: dict[tuple, dict[int, dict]] = defaultdict(dict)
         for r in main:
@@ -466,7 +466,7 @@ class Experiment:
         if gated:
             out["gate_on_rate"] = float(np.mean(gated))
         if base is not None:
-            b_main = [r for r in base if r["pair_type"] in ("changing", "invariant")]
+            b_main = [r for r in base if r["pair_type"] in M.MAIN_TYPES]
             b_task: dict[str, list[bool]] = defaultdict(list)
             for r in b_main:
                 b_task[r["task_id"]].append(r["ok"])
@@ -485,7 +485,7 @@ class Experiment:
         def by_task(recs):
             d: dict[str, list[bool]] = defaultdict(list)
             for r in recs:
-                if r["pair_type"] in ("changing", "invariant"):
+                if r["pair_type"] in M.MAIN_TYPES:
                     d[r["task_id"]].append(r.get("ok", r.get("success")))
             return d
         pe = M.paired_bootstrap(by_task(recs_b), by_task(recs_a), n_boot=self.cfg.eval.n_boot,
@@ -501,7 +501,7 @@ class Experiment:
         rep = S.audit(tasks)
         if not rep.ok:
             raise ValueError(f"аудит данных не пройден:\n{rep}")
-        splits = S.split_tasks(tasks, tuple(c.split), seed=c.seed)
+        splits = S.split_tasks(tasks, tuple(c.split), seed=c.seed, stratify_pair_type=c.stratify_pair_type)
         self.state.update(tasks=tasks, splits=splits)
         by_pos: dict[str, int] = defaultdict(int)
         for t in tasks:
@@ -556,8 +556,8 @@ class Experiment:
         self._need("data")
         layers = self._layers_for_probe()
         windows = sorted(set(self.cfg.probe.windows) | set(self.cfg.steer.windows))
-        ch = self._tasks("train", ("changing",))
-        inv = self._tasks("train", ("invariant",))
+        ch = self._tasks("train", M.TARGET_TYPES)
+        inv = self._tasks("train", M.GUARD_TYPES)
         ch_p = [(t, b, self._prompt(t, b)) for t in ch for b in (0, 1)]
         inv_p = [(t, b, self._prompt(t, b)) for t in inv for b in (0, 1)]
         ch_a = self._acts([p for *_, p in ch_p], layers, windows)
@@ -604,7 +604,7 @@ class Experiment:
             best[r["layer"]] = max(best.get(r["layer"], 0.0), r["auroc"])
         return sorted(sorted(best, key=best.get, reverse=True)[: c.top_k_layers])
 
-    def _train_ok(self, kinds=("changing",)) -> dict[tuple[str, int], bool]:
+    def _train_ok(self, kinds=M.TARGET_TYPES) -> dict[tuple[str, int], bool]:
         """Верно ли база решила каждую ветку train (trial 0) — метка для CAA, гейта, TACT."""
         recs = self.state["records"]["train"]["baseline"]
         return {(r["task_id"], r["branch"]): r["ok"] for r in recs
@@ -616,7 +616,7 @@ class Experiment:
         иначе вмешательство знало бы правильный ответ."""
         self._need("data", "baseline")
         ok = self._train_ok()
-        tasks = {t.task_id: t for t in self._tasks("train", ("changing",))}
+        tasks = {t.task_id: t for t in self._tasks("train", M.TARGET_TYPES)}
         prompts = [(k, self._prompt(tasks[k[0]], k[1])) for k in sorted(ok)]
         layers, windows = self._steer_layers(), list(self.cfg.steer.windows)
         acts = self._acts([p for _, p in prompts], layers, windows)
@@ -714,8 +714,8 @@ class Experiment:
         if not vecs:
             res["reason"] = "нет векторов steering — гейту нечего включать"
             return res
-        ok = self._train_ok(("changing", "invariant"))
-        tasks = {t.task_id: t for t in self._tasks("train", ("changing", "invariant"))}
+        ok = self._train_ok(M.MAIN_TYPES)
+        tasks = {t.task_id: t for t in self._tasks("train", M.MAIN_TYPES)}
         keys = sorted(ok)
         y = np.array([0 if ok[k] else 1 for k in keys])
         mn = self.cfg.steer.min_class_examples
@@ -765,18 +765,18 @@ class Experiment:
         c = self.cfg.tact
         res: dict[str, Any] = {"rows": [], "row": None}
         layers = list(range(self.backend.n_layers))
-        ok_ch = self._train_ok(("changing",))
-        ok_all = self._train_ok(("changing", "invariant"))
+        ok_ch = self._train_ok(M.TARGET_TYPES)
+        ok_all = self._train_ok(M.MAIN_TYPES)
         n_fail = sum(not v for v in ok_ch.values())
         n_ok = sum(ok_ch.values())
         mn = self.cfg.steer.min_class_examples
         if n_fail < mn or n_ok < mn:
             res["reason"] = f"мало материала для оси: сбоев {n_fail}, верных {n_ok} на меняющих парах train"
             return res
-        tasks = {t.task_id: t for t in self._tasks("train", ("changing", "invariant"))}
+        tasks = {t.task_id: t for t in self._tasks("train", M.MAIN_TYPES)}
         keys = sorted(ok_all)
         acts = dict(zip(keys, self._acts([self._prompt(tasks[t], b) for t, b in keys], layers, [c.window])))
-        val_tasks = self._tasks("val", ("changing", "invariant"))
+        val_tasks = self._tasks("val", M.MAIN_TYPES)
         vkeys = [(t, b) for t in val_tasks for b in (0, 1)]
         vacts = self._acts([self._prompt(t, b) for t, b in vkeys], layers, [c.window])
         vbad = {(r["task_id"], r["branch"]): not r["ok"]
@@ -827,10 +827,11 @@ class Experiment:
         c = self.cfg.lora
         res: dict[str, Any] = {"rows": [], "row": None}
         examples = []
-        for t in self._tasks("train", ("changing",)):
+        for t in self._tasks("train", M.TARGET_TYPES):
             for b in (0, 1):
                 gold = sorted(t.branch(b).allowed_actions)[0]
-                args = E.Env(t, b).canonical_arguments(gold)
+                args = (S.g1_arguments(t, b) if t.pair_type == "global"
+                        else E.Env(t, b).canonical_arguments(gold))
                 examples.append(self.backend.sft_example(self._prompt(t, b), gold, args))
         if not examples:
             res["reason"] = "нет меняющих пар в train"
@@ -890,8 +891,8 @@ class Experiment:
         return out
 
     def _train_changing(self) -> tuple[list[S.PairedTask], list[tuple[str, int]]]:
-        """Те же данные, что у вектора и LoRA: меняющие пары train, обе ветки."""
-        tasks = self._tasks("train", ("changing",))
+        """Те же данные, что у вектора и LoRA: целевые пары train (меняющие / global), обе ветки."""
+        tasks = self._tasks("train", M.TARGET_TYPES)
         return tasks, [(t.task_id, b) for t in tasks for b in (0, 1)]
 
     def _fit_affine_grid(self, name: str, maps: dict[int, Any], alphas: list[float],
@@ -951,14 +952,29 @@ class Experiment:
         acache.save(prompts[0].key, {key: np.array([per])})
         return per
 
+    def _teacher(self) -> tuple[str, Any]:
+        """(тег кэша, промпт базы → промпт учителя) для cfg.act.teacher: двухшаговый вариант
+        (explicit_state, restate) или одношаговый метод-промпт (policy_prompt — правило g1 в system)."""
+        dc, teacher = self.cfg.decision, self.cfg.act.teacher
+        if teacher in TWO_STEP:
+            ask, go, n_ask = TWO_STEP[teacher]
+            return (f"call_point@prompt:{sha([ask, go, n_ask, dc.mode, dc.temperature], 8)}",
+                    lambda p: self.backend.two_step_prompt(p, ask, go, n_ask))
+        spec = get_method(teacher)
+        if spec.variant in ("baseline", *TWO_STEP) or spec.fitted or spec.steer or spec.adapter:
+            raise ValueError(f"учитель {teacher!r}: нужен двухшаговый вариант или одношаговый метод-промпт")
+        by = {t.task_id: t for t in self.state["tasks"]}
+        fp = MethodRun(spec, strong_prompt=self.cfg.eval.strong_prompt).fingerprint()
+        return (f"call_point@{spec.variant}:{sha([fp, dc.mode, dc.temperature], 8)}",
+                lambda p: self._prompt(by[p.meta["task_id"]], p.meta["branch"], spec.variant))
+
     def _teacher_call_point(self, prompts: list[Prompt],
                             layers: list[int]) -> tuple[list[dict[int, np.ndarray]], list[str]]:
-        """Учитель-промпт: двухшаговый вариант cfg.act.teacher на тех же промптах (жадно).
+        """Учитель-промпт cfg.act.teacher на тех же промптах (жадно).
         Кэш по ключу промпта базы: состояния учителя в точке вызова и его действие."""
         _, acache = self._caches()
         dc = self.cfg.decision
-        ask, go, n_ask = TWO_STEP[self.cfg.act.teacher]
-        tag = f"call_point@prompt:{sha([ask, go, n_ask, dc.mode, dc.temperature], 8)}"
+        tag, make = self._teacher()
         acts, actions = [], []
         for p in _progress(prompts, f"teacher {self.cfg.act.teacher}", len(prompts),
                            disable=not self.verbose or len(prompts) < 4):
@@ -966,7 +982,7 @@ class Experiment:
             keys = {L: f"L{L}|{tag}" for L in layers}
             ak = f"action|{tag}"
             if not (ak in got and all(k in got for k in keys.values())):
-                tp = self.backend.two_step_prompt(p, ask, go, n_ask)
+                tp = make(p)
                 rec = self.backend.record_call_point(tp, layers)
                 d = self.backend.decide(tp, dc.mode, None, dc.temperature, 0)
                 acache.save(p.key, {**{keys[L]: v for L, v in rec.items()},
@@ -1004,7 +1020,7 @@ class Experiment:
             per += self._seconds_per_prompt(f"call_point@{ad.adapter_id}:{lk}",
                                             lambda p: self.backend.record_call_point(p, layers, ad), prompts)
         elif kind == "contrast":
-            ok = self._train_ok(("changing",))
+            ok = self._train_ok(M.TARGET_TYPES)
             correct = [ok[k] for k in keys]
             if all(correct) or not any(correct):
                 return {"reason": "нужны и верные, и неверные решения базы на train"}
@@ -1014,14 +1030,14 @@ class Experiment:
         elif kind == "prompt":
             ht, actions = self._teacher_call_point(prompts, layers)
             t_ok = [S.score_action(a, by[t].branch(b)) for a, (t, b) in zip(actions, keys)]
-            b_ok = self._train_ok(("changing",))
+            b_ok = self._train_ok(M.TARGET_TYPES)
             out["D"] = {L: IV.teacher_targets(H[L], np.stack([x[L] for x in ht]), t_ok) for L in layers}
             out.update(teacher=self.cfg.act.teacher, teacher_ok=t_ok, teacher_train_success=float(np.mean(t_ok)),
                        base_train_success=float(np.mean([b_ok[k] for k in keys])))
-            ask, go, n_ask = TWO_STEP[self.cfg.act.teacher]
+            _, make = self._teacher()
 
             def teach(p: Prompt) -> None:
-                tp = self.backend.two_step_prompt(p, ask, go, n_ask)
+                tp = make(p)
                 self.backend.record_call_point(tp, layers)
                 self.backend.decide(tp, self.cfg.decision.mode, None, self.cfg.decision.temperature, 0)
 
@@ -1087,7 +1103,7 @@ class Experiment:
         if split not in self.state["splits"]:
             self.state["splits"][split] = [t for t in self.state["splits"]["train"]
                                            if S.requirement_kind(t) == kind
-                                           and t.pair_type in ("changing", "invariant")]
+                                           and t.pair_type in M.MAIN_TYPES]
         recs = self.state.setdefault("records", {}).setdefault(split, {})
         if "baseline" not in recs:
             recs["baseline"] = (self.evaluate("baseline", split, write=False)
@@ -1409,7 +1425,8 @@ class Experiment:
         """
         self._need("fit")
         c = self.cfg.transfer
-        sets = S.build_transfer_set(c.n_tasks, c.seed, tuple(c.seen), tuple(c.unseen))
+        sets = S.build_transfer_set(c.n_tasks, c.seed, tuple(c.seen), tuple(c.unseen),
+                                    family="g1" if self.cfg.data.generator == "g1" else "v3")
         known = {S.signature(t) for k, v in self.state["splits"].items()
                  if not k.startswith("transfer:") for t in v}
         res: dict[str, Any] = {"cfg": {"n_tasks": c.n_tasks, "seed": c.seed, "seen": list(c.seen),
@@ -1478,7 +1495,7 @@ class Experiment:
         first = D.first_tokens(be)
         names = list(first)
         layers = list(range(be.n_layers))
-        tasks = self._tasks("train", ("changing", "invariant"))
+        tasks = self._tasks("train", M.MAIN_TYPES)
         base_scored = {(r["task_id"], r["branch"]): r["action"]
                        for r in self.state["records"]["train"]["baseline"] if r["trial"] == 0}
         lora_scored = {(r["task_id"], r["branch"]): r["action"]
@@ -1575,7 +1592,7 @@ class Experiment:
         else:
             last = summ[summ["set"] == "last"].sort_values("effect", ascending=False)
             top = [int(x) for x in last["layer"].head(form_layers)]
-        tasks = {t.task_id: t for t in self._tasks("train", ("changing", "invariant"))}
+        tasks = {t.task_id: t for t in self._tasks("train", M.MAIN_TYPES)}
         names = list(first)
         lora_a = np.array([m["lora_action"] for m in meta])
         base_a = np.array([m["base_action"] for m in meta])
@@ -1794,7 +1811,7 @@ class Experiment:
 
         if "data" not in self.done:
             self.data()
-        tasks = self._tasks("train", ("changing",))[:n_samples]
+        tasks = self._tasks("train", M.TARGET_TYPES)[:n_samples]
         # Загрузка модели, построение промптов и прогрев (кэш системного хода) — вне замера.
         prompts = [self._prompt(t, 0) for t in tasks]
         self.backend.decide(self._prompt(tasks[0], 1), self.cfg.decision.mode, None,
@@ -1815,7 +1832,7 @@ class Experiment:
         per_record = time.perf_counter() - t0
 
         n = {k: len(v) for k, v in self.state["splits"].items()}
-        nm = {k: len(self._tasks(k, ("changing", "invariant"))) for k in n}
+        nm = {k: len(self._tasks(k, M.MAIN_TYPES)) for k in n}
         tr = self.cfg.decision.n_trials
         n_vec = self.cfg.steer.top_k_layers * len(self.cfg.steer.windows)
         methods = self.cfg.eval.methods

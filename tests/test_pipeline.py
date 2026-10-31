@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -765,3 +766,72 @@ def test_hf_two_step_prompt_and_affine_stack(chatml_tokenizer):
     base = be.decide(p, "scored", None, 0.0, 0).scores
     on = be.decide(p, "scored", ResolvedAffineStack(parts), 0.0, 0, with_args=True, arg_tokens=4)
     assert on.hook_applied == 1 and max(abs(base[k] - on.scores[k]) for k in base) > 1e-4
+
+
+G1_METHODS = ["baseline", "policy_prompt", "steering", "lora", "linmap", "linmap_prompt"]
+G1_OV = {"data.generator": "g1", "data.n_tasks": 120, "data.stratify_pair_type": True,
+         "episode.enabled": False, "act.teacher": "policy_prompt", "eval.methods": G1_METHODS,
+         "act.ranks": [8], "act.alphas": [0.5, 1.0, 2.0], "transfer.n_tasks": 40,
+         "transfer.episode_methods": []}
+
+
+def test_global_slice_on_mock(root):
+    with pytest.raises(ValueError, match="эпизоды не определены"):
+        _exp(root, **{**G1_OV, "episode.enabled": True})
+    exp = _exp(root, **G1_OV)
+    exp.run("fit")
+    assert set(exp.state["data_summary"]["by_type"]) == {"global", "control"}
+    s = exp.state["summaries"]["val"]
+    assert s["policy_prompt"]["sensitivity"] > s["baseline"]["sensitivity"]   # mock: правило словами помогает
+    lp = exp.state["fitted"]["linmap_prompt"]
+    assert lp["rows"] and lp["teacher"] == "policy_prompt"
+    assert lp["teacher_train_success"] > lp["base_train_success"]
+    tasks, keys = exp._train_changing()
+    assert tasks and all(t.pair_type == "global" for t in tasks)
+    assert exp.state["fitted"]["linmap"]["rows"]                          # у базы есть и верные, и неверные
+    res = exp.transfer()
+    for g in ("seen", "unseen"):
+        assert {t.pair_type for t in exp.state["splits"][f"transfer:{g}"]} == {"global", "control"}
+        assert not res[g]["episodes"]
+    # повтор — учитель policy_prompt из кэша
+    be = MockBackend()
+    exp2 = _exp(root, backend=be, **G1_OV)
+    exp2.run("fit")
+    assert be.calls == {"decide": 0, "record": 0, "train": 0}
+
+
+def test_crossslice_h4_prime_on_mock(root):
+    from steering_tool_feedback import crossslice as X
+
+    methods = ["baseline", "lora", "linmap", "linmap_prompt"]
+    common = {"act.ranks": [8], "act.alphas": [0.5, 1.0, 2.0], "transfer.n_tasks": 40,
+              "transfer.episode_methods": []}
+    cond = _exp(root, **{**common, "eval.methods": methods})
+    cond.run("fit")
+    cond.transfer()
+    glob = _exp(root, **{**G1_OV, **common, "eval.methods": methods})
+    glob.run("fit")
+    glob.transfer()
+    out = X.compare(cond.dir, glob.dir, "transfer:seen", n_boot=500)
+    assert out["level"] == 0.975 and [r["method"] for r in out["rows"]] == ["linmap", "linmap_prompt"]
+    for r in out["rows"]:
+        assert math.isclose(r["I"], r["delta_cond"] - r["delta_glob"], abs_tol=1e-12)
+        assert r["ci_low"] <= r["I"] <= r["ci_high"]
+        assert isinstance(r["eligible_cond"], bool) and isinstance(r["eligible_glob"], bool)
+    assert out["verdict"].preliminary and out["verdict"].status in ("support", "against", "inconclusive")
+    with pytest.raises(FileNotFoundError):
+        X.compare(cond.dir, glob.dir, "transfer:seen", methods=("reft",))
+
+
+def test_gate_h4_prime():
+    def row(m, lo, hi, ec=True, eg=True):
+        return {"method": m, "I": (lo + hi) / 2, "ci_low": lo, "ci_high": hi, "eligible_cond": ec, "eligible_glob": eg}
+    assert G.h4_prime([], True).status == "not_run"
+    assert G.h4_prime([row("a", 0.05, 0.3), row("b", -0.1, 0.2)], True).status == "support"
+    assert G.h4_prime([row("a", -0.3, -0.05), row("b", -0.1, 0.2)], False).status == "against"
+    assert G.h4_prime([row("a", 0.05, 0.3), row("b", -0.3, -0.05)], True).status == "inconclusive"
+    assert G.h4_prime([row("a", -0.04, 0.04), row("b", -0.03, 0.05)], True).status == "against"
+    assert G.h4_prime([row("a", -0.2, 0.2)], True).status == "inconclusive"
+    # выигрыш на срезе, где метод сломал специфичность, не засчитывается
+    assert G.h4_prime([row("a", 0.05, 0.3, ec=False)], True).status == "inconclusive"
+    assert G.h4_prime([row("a", -0.3, -0.05, eg=False)], True).status == "inconclusive"

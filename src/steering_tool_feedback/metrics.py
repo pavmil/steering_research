@@ -16,7 +16,13 @@ from typing import Iterable, Literal, Sequence
 
 import numpy as np
 
-PairType = Literal["changing", "invariant", "stress"]
+PairType = Literal["changing", "invariant", "stress", "global", "control"]
+
+# Целевые и охранные пары (как в simulator.TARGET_TYPES / GUARD_TYPES). На глобальном срезе (H4′)
+# global — принятие правила, control — сохранность; в таблицах это те же sensitivity / specificity.
+TARGET_TYPES = ("changing", "global")
+GUARD_TYPES = ("invariant", "control")
+MAIN_TYPES = TARGET_TYPES + GUARD_TYPES
 
 
 # --------------------------------------------------------------------------
@@ -86,7 +92,7 @@ class PairOutcome:
 
     task_id    — исходная задача; обе ветки и все повторы делят один id,
                  по нему группируем при bootstrap.
-    pair_type  — changing / invariant / stress.
+    pair_type  — changing / invariant / stress (условный срез), global / control (глобальный, H4′).
     action_ok_0, action_ok_1 — попало ли следующее действие в множество
                  допустимых A* в каждой ветке (не совпадение со строкой-эталоном!).
     action_changed — различается ли выбранное действие между ветками.
@@ -103,10 +109,11 @@ class PairOutcome:
 
     @property
     def behaved_correctly(self) -> bool:
-        """Для changing действие должно смениться, для invariant — нет."""
+        """Для changing действие должно смениться, для invariant и global — нет;
+        для control и stress — верно в обеих ветках."""
         if self.pair_type == "changing":
             return self.action_changed and self.action_ok_0 and self.action_ok_1
-        if self.pair_type == "invariant":
+        if self.pair_type in ("invariant", "global"):
             return (not self.action_changed) and self.action_ok_0 and self.action_ok_1
         return self.action_ok_0 and self.action_ok_1
 
@@ -128,15 +135,16 @@ class TargetEffect:
 
 
 def target_effect(outcomes: Sequence[PairOutcome]) -> TargetEffect:
-    """Доля корректных переключений на changing и корректных сохранений на invariant.
+    """Доля корректных переключений на changing и корректных сохранений на invariant
+    (на глобальном срезе — принятие правила на global и сохранность на control).
 
     Отчитываются только вместе — порознь они не интерпретируются.
     """
-    changing = [o for o in outcomes if o.pair_type == "changing"]
-    invariant = [o for o in outcomes if o.pair_type == "invariant"]
+    changing = [o for o in outcomes if o.pair_type in TARGET_TYPES]
+    invariant = [o for o in outcomes if o.pair_type in GUARD_TYPES]
     if not changing or not invariant:
         raise ValueError(
-            "need both changing and invariant pairs; "
+            "need both target (changing/global) and guard (invariant/control) pairs; "
             "reporting sensitivity without specificity is meaningless"
         )
     return TargetEffect(
@@ -273,6 +281,60 @@ def paired_bootstrap(
         ci_high=float(np.quantile(boot, 1 - alpha / 2)),
         n_tasks=len(tasks),
     )
+
+
+@dataclass(frozen=True)
+class InteractionEstimate:
+    """H4′: (метод − ориентир) в срезе A минус то же в срезе B, с интервалом уровня level.
+    delta_a, delta_b — парные разности в каждом срезе с интервалами того же уровня."""
+
+    delta_a: PairedEstimate
+    delta_b: PairedEstimate
+    mean: float
+    ci_low: float
+    ci_high: float
+    level: float
+
+    @property
+    def excludes_zero(self) -> bool:
+        return self.ci_low > 0 or self.ci_high < 0
+
+
+def interaction_bootstrap(
+    ref_a: dict[str, Sequence[bool]],
+    method_a: dict[str, Sequence[bool]],
+    ref_b: dict[str, Sequence[bool]],
+    method_b: dict[str, Sequence[bool]],
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> InteractionEstimate:
+    """Разность парных эффектов двух срезов (docs/METRICS.md «Глобальный срез»).
+
+    В каждом срезе — средняя по задачам разность (метод − ориентир), как в paired_bootstrap.
+    Срезы — разные наборы задач, поэтому ресемплинг независимый: интервал разности строится
+    из разностей независимых bootstrap-средних.
+    """
+    def per_task(ref: dict, m: dict) -> np.ndarray:
+        tasks = sorted(set(ref) & set(m))
+        if not tasks:
+            raise ValueError("no shared tasks")
+        return np.array([np.mean([bool(x) for x in m[t]]) - np.mean([bool(x) for x in ref[t]])
+                         for t in tasks], dtype=float)
+
+    da, db = per_task(ref_a, method_a), per_task(ref_b, method_b)
+    rng = np.random.default_rng(seed)
+    ba = da[rng.integers(0, len(da), size=(n_boot, len(da)))].mean(axis=1)
+    bb = db[rng.integers(0, len(db), size=(n_boot, len(db)))].mean(axis=1)
+    lo, hi = alpha / 2, 1 - alpha / 2
+
+    def est(d: np.ndarray, b: np.ndarray) -> PairedEstimate:
+        return PairedEstimate(mean_diff=float(d.mean()), ci_low=float(np.quantile(b, lo)),
+                              ci_high=float(np.quantile(b, hi)), n_tasks=len(d))
+
+    boot = ba - bb
+    return InteractionEstimate(est(da, ba), est(db, bb), float(da.mean() - db.mean()),
+                               float(np.quantile(boot, lo)), float(np.quantile(boot, hi)), 1 - alpha)
 
 
 # --------------------------------------------------------------------------

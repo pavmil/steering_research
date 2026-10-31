@@ -468,3 +468,79 @@ def test_cast_pieces():
     assert cond["f1"] > 0.95
     fired = np.array([IV.cast_fires(s, cond) for s in sim])
     assert (fired == (y == 1)).mean() > 0.95
+
+
+# --------------------------------------------------------------------------
+# глобальный срез (H4′): генератор g1, метрики, эффект между срезами
+# --------------------------------------------------------------------------
+
+
+def test_g1_generator_global_and_control_pairs():
+    ts = S.build_pilot_set(160, seed=0, version="g1")
+    assert S.audit(ts).ok
+    by = {k: [t for t in ts if t.pair_type == k] for k in ("global", "control")}
+    assert len(by["global"]) == 112 and len(by["control"]) == 48       # доли точные: 70 / 30
+    for t in by["global"]:
+        assert t.world_0.allowed_actions == t.world_1.allowed_actions == {S.GLOBAL_ACTION}
+        assert t.tool_call["tool"] == "check_stock" and not t.condition_explicit
+        assert S.semantic_state(t.world_0) == 0 and S.semantic_state(t.world_1) == 1
+        assert S.G1_POLICY not in t.instruction                        # правило не написано в промпте
+        assert S.g1_arguments(t, 1)["question"] != S.g1_arguments(t, 0)["question"]
+    kinds = {t.notes.split("control=")[1].split()[0] for t in by["control"]}
+    assert kinds == {"answer", "form"}
+    for t in by["control"]:
+        assert t.tool_call["tool"] == "ask_user" and t.prompt(0)[-1]["name"] == "ask_user"
+        a0, a1 = t.world_0.allowed_actions, t.world_1.allowed_actions
+        assert S.GLOBAL_ACTION not in a0 | a1                          # спросить снова — ошибка
+        if "control=answer" in t.notes:
+            assert (a0, a1) == ({"place_order"}, {"search_alternative"})
+        else:
+            assert a0 == a1
+    assert {S.requirement_kind(t) for t in ts} == {"none", "deadline", "quantity", "budget"}
+    assert [S.signature(t) for t in ts] == [S.signature(t) for t in S.build_pilot_set(160, 0, "g1")]
+    with pytest.raises(ValueError, match="global pair must share"):
+        g = by["global"][0]
+        g.world_1.allowed_actions = frozenset({"place_order"})
+        g.validate()
+
+
+def test_g1_stratified_split_and_transfer():
+    ts = S.build_pilot_set(160, seed=0, version="g1")
+    sp = S.split_tasks(ts, (0.5, 0.2, 0.3), seed=0, stratify_pair_type=True)
+    for k in ("train", "val", "test"):
+        n = {p: sum(t.pair_type == p for t in sp[k]) for p in ("global", "control")}
+        assert n["control"] >= 0.25 * (n["global"] + n["control"]) - 1, (k, n)
+    v3 = S.build_pilot_set(120, seed=3)
+    assert ({k: [t.task_id for t in v] for k, v in S.split_tasks(v3, seed=3).items()}
+            == {k: [t.task_id for t in v] for k, v in S.split_tasks(v3, seed=3, stratify_pair_type=False).items()})
+    x = S.build_transfer_set(60, 606, family="g1")
+    assert {t.pair_type for g in x.values() for t in g} == {"global", "control"}
+    assert {S.requirement_kind(t) for t in x["unseen"]} <= {"rating", "warranty"}
+    assert not {S.signature(t) for g in x.values() for t in g} & {S.signature(t) for t in ts}
+
+
+def test_global_and_control_outcomes():
+    g_ok = M.PairOutcome("g", "global", True, True, False, True, True)
+    g_half = M.PairOutcome("g2", "global", True, False, True, True, False)
+    c_ok = M.PairOutcome("c", "control", True, True, True, True, True)
+    c_bad = M.PairOutcome("c2", "control", False, True, True, False, True)
+    assert g_ok.behaved_correctly and not g_half.behaved_correctly
+    assert c_ok.behaved_correctly and not c_bad.behaved_correctly
+    eff = M.target_effect([g_ok, g_half, c_ok, c_bad])
+    assert (eff.sensitivity, eff.specificity, eff.n_changing, eff.n_invariant) == (0.5, 0.5, 2, 2)
+    with pytest.raises(ValueError):
+        M.target_effect([g_ok, g_half])
+
+
+def test_interaction_bootstrap():
+    rng = np.random.default_rng(0)
+    ref_a = {f"a{i}": [True, True] for i in range(60)}
+    m_a = {k: [True, bool(rng.random() < 0.9)] for k in ref_a}      # Δ_A ≈ −0.05
+    ref_b = {f"b{i}": [True, True] for i in range(60)}
+    m_b = {k: [bool(rng.random() < 0.4), True] for k in ref_b}      # Δ_B ≈ −0.3
+    est = M.interaction_bootstrap(ref_a, m_a, ref_b, m_b, n_boot=2000, alpha=0.025)
+    assert math.isclose(est.mean, est.delta_a.mean_diff - est.delta_b.mean_diff)
+    assert est.ci_low > 0 and est.excludes_zero and est.level == 0.975
+    assert est.delta_b.ci_high < 0
+    same = M.interaction_bootstrap(ref_a, m_a, ref_a, m_a, n_boot=2000)
+    assert same.mean == 0 and same.ci_low < 0 < same.ci_high

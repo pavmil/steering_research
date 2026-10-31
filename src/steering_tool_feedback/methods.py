@@ -9,6 +9,7 @@
 | strong_prompt    | 1               | явная инструкция учитывать ответ (в system)         |
 | restate          | 2               | модель пересказывает ответ, затем выбирает действие |
 | explicit_state   | 3               | OODA: модель пишет явное состояние задачи, затем действует |
+| policy_prompt    | H4′             | правило глобального среза (g1) словами в system — промпт-ориентир |
 | lora             | 4               | LoRA/SFT на тех же данных, что и вектор              |
 | steering         | 5               | CAA-вектор в окне после ответа, всегда включён       |
 | steering_gated   | 6               | тот же вектор, но только если обучаемый гейт сработал |
@@ -60,7 +61,7 @@ TWO_STEP: dict[str, tuple[str, str, int]] = {
 @dataclass(frozen=True)
 class MethodSpec:
     name: str
-    variant: str                    # baseline | strong_prompt | restate | explicit_state
+    variant: str                    # baseline | strong_prompt | restate | explicit_state | policy
     steer: bool = False             # CAA-вектор в окне (SteerSpec)
     sham: str | None = None         # вид sham-контроля для steering
     gate: bool = False              # steering только при срабатывании гейта (GateSpec)
@@ -83,6 +84,9 @@ METHODS: dict[str, MethodSpec] = {
     "explicit_state": MethodSpec("explicit_state", "explicit_state",
                                  note="OODA-подобное явное состояние, которое пишет модель "
                                       "перед действием. Главный конкурент по дешевизне."),
+    "policy_prompt": MethodSpec("policy_prompt", "policy",
+                                note="Правило глобального среза (simulator.G1_POLICY) словами в system. "
+                                     "Промпт-ориентир и учитель linmap_prompt на g1 (H4′)."),
     "steering": MethodSpec("steering", "baseline", steer=True),
     "steering_gated": MethodSpec("steering_gated", "baseline", gate=True, fitted=True,
                                  note="Вектор steering включается, только если гейт на "
@@ -134,9 +138,10 @@ def build_messages(task: S.PairedTask, branch: int, variant: str,
     msgs = task.prompt(branch)
     if variant in ("baseline", "restate", "explicit_state"):
         return msgs
-    if variant == "strong_prompt":
+    if variant in ("strong_prompt", "policy"):
         sys = dict(msgs[0])
-        sys["content"] = f"{sys['content']}\n\n{strong_prompt}"
+        extra = strong_prompt if variant == "strong_prompt" else S.G1_POLICY
+        sys["content"] = f"{sys['content']}\n\n{extra}"
         return [sys, *msgs[1:]]
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -252,6 +257,8 @@ class MethodRun:
         parts: list[Any] = [self.spec.variant]
         if self.spec.variant == "strong_prompt":
             parts.append(sha(self.strong_prompt))
+        if self.spec.variant == "policy":
+            parts.append(sha(S.G1_POLICY))
         if self.spec.variant in TWO_STEP:
             parts.append(sha(list(TWO_STEP[self.spec.variant])))
         if self.steer is not None:

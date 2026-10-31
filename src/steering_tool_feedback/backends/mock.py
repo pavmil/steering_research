@@ -127,12 +127,14 @@ class MockBackend:
             if _u(p.key, "cont", trial) < 0.08 + harm:
                 return sorted(set(S.ACTIONS) - set(allowed))[0]
             return allowed[0]
-        if kind == "invariant":
+        if kind in ("invariant", "control"):
             if _u(p.meta["task_id"], p.meta["branch"], "harm", trial) < harm:
                 return sorted(set(S.ACTIONS) - set(allowed))[0]
             return allowed[0]
         if self._would_use(p, boost, trial):
             return allowed[0]
+        if kind == "global":        # без правила база действует по ответу: заказ / поиск замены
+            return "place_order" if p.meta["branch"] == 0 else "search_alternative"
         return (other or allowed)[0]
 
     @staticmethod
@@ -187,6 +189,8 @@ class MockBackend:
         boost, harm = self._steer_effect(steer)
         if prompt.meta.get("variant") == "strong_prompt":
             boost += 0.12
+        if prompt.meta.get("variant") == "policy":
+            boost += 0.3
         if prompt.meta.get("variant") == "two_step":
             boost += 0.24
         if adapter is not None:
@@ -213,7 +217,7 @@ class MockBackend:
 
     def record_call_point(self, prompt, layers, adapter=None):
         rec = self.record(prompt, layers, ["action_point"])
-        shift = 0.5 if adapter is not None else 0.3 if prompt.meta.get("variant") == "two_step" else 0.0
+        shift = 0.5 if adapter is not None else 0.3 if prompt.meta.get("variant") in ("two_step", "policy") else 0.0
         return {L: rec[(L, "action_point")] + shift * self._use[L].astype(np.float32) for L in layers}
 
     # --- «обучение» адаптера --------------------------------------------

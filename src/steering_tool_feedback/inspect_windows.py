@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tokenizer", required=True, help="HF id или локальная папка с токенизатором")
     ap.add_argument("--per-type", type=int, default=1, help="сколько задач каждого типа пары")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--generator", default=S.GENERATOR_VERSION, choices=sorted(S.GENERATORS),
+                    help="семейство задач (g1 — глобальный срез H4′)")
     ap.add_argument("--k-post", type=int, default=4)
     ap.add_argument("--context", type=int, default=3, help="токенов контекста по краям окна")
     ap.add_argument("--no-tools", action="store_true", help="не передавать схемы инструментов")
@@ -47,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: у токенизатора нет chat_template", file=sys.stderr)
         return 1
 
-    tasks = S.build_pilot_set(120, seed=args.seed)
+    tasks = S.build_pilot_set(120, seed=args.seed, version=args.generator)
     tools = None if args.no_tools else S.tools_schema()
 
     if args.all:
@@ -64,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if bad else 0
 
     picked: list[S.PairedTask] = []
-    for kind in ("changing", "invariant", "stress"):
+    for kind in (*S.MAIN_TYPES, "stress"):
         picked += [t for t in tasks if t.pair_type == kind][: args.per_type]
 
     failed = 0

@@ -130,6 +130,34 @@ def h4(test: dict | None, val_cmp: dict | None) -> Verdict:
     return Verdict("against", f"LoRA не хуже steering на условном срезе: steering − LoRA {ci}", prelim)
 
 
+def h4_prime(rows: list[dict], preliminary: bool, margin: float = 0.05) -> Verdict:
+    """H4′ (HYPOTHESES.md, решение Павла 2026-10-31): поправки активаций без градиента относительно
+    LoRA сильнее на условном срезе, чем на глобальном.
+
+    rows — по проверяемому методу (crossslice.compare): I = Δ_усл − Δ_глоб с интервалом уровня по Холму,
+    eligible_cond / eligible_glob — специфичность (сохранность) не упала больше допуска отбора.
+    Метод «за» — интервал I выше нуля и он годен на условном срезе; «против» — ниже нуля и годен
+    на глобальном (выигрыш негодного метода не засчитывается); «нет разницы» — интервал внутри ±margin.
+    """
+    if not rows:
+        return Verdict("not_run", "нужны прогоны обоих срезов с LoRA и проверяемыми методами")
+    pro = [r["method"] for r in rows if r["ci_low"] > 0 and r["eligible_cond"]]
+    con = [r["method"] for r in rows if r["ci_high"] < 0 and r["eligible_glob"]]
+    same = [r["method"] for r in rows if -margin <= r["ci_low"] and r["ci_high"] <= margin]
+    desc = "; ".join(f"{r['method']}: I {r['I']:+.3f} [{r['ci_low']:+.3f}, {r['ci_high']:+.3f}]" for r in rows)
+    if pro and con:
+        return Verdict("inconclusive", f"методы расходятся (за: {', '.join(pro)}; против: "
+                                       f"{', '.join(con)}) — {desc}", preliminary)
+    if pro:
+        return Verdict("support", f"поправки ближе к LoRA на условном срезе — {desc}", preliminary)
+    if con:
+        return Verdict("against", f"поправки ближе к LoRA на глобальном срезе — {desc}", preliminary)
+    if len(same) == len(rows):
+        return Verdict("against", f"разницы между срезами нет (все интервалы внутри ±{margin}) — {desc}",
+                       preliminary)
+    return Verdict("inconclusive", f"интервалы включают ноль — {desc}", preliminary)
+
+
 def alternatives(test: dict | None, val_cmp: dict | None, summaries: dict | None,
                  cheap: tuple[str, ...] = ("strong_prompt", "restate", "explicit_state"),
                  cost_slack: float = 1.1) -> Verdict:

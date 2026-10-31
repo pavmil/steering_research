@@ -47,10 +47,12 @@ class ModelCfg:
 
 @dataclass
 class DataCfg:
-    generator: str = "v3"              # v2 — явный смысл ответа; v3 — смысл относительно цели
+    generator: str = "v3"              # v2 — явный смысл ответа; v3 — смысл относительно цели;
+                                       # g1 — глобальный срез H4′ (правило ask_user, контрольные пары)
     n_tasks: int = 120
     seed: int = 0
     split: tuple[float, float, float] = (0.5, 0.2, 0.3)
+    stratify_pair_type: bool = False   # делить train/val/test внутри каждого типа пары (для g1)
     use_tools_schema: bool = True
     k_post: int = 4
 
@@ -147,7 +149,8 @@ class ActCfg:
     reft_epochs: int = 3
     cast_behavior_fracs: list[float] = field(default_factory=lambda: [0.57, 0.71, 0.86])
     cast_alphas: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
-    # linmap_prompt: учитель — та же модель с двухшаговым промптом (methods.TWO_STEP).
+    # linmap_prompt: учитель — та же модель с двухшаговым промптом (methods.TWO_STEP) или с
+    # одношаговым методом-промптом: policy_prompt — правило глобального среза g1 в system (H4′).
     teacher: str = "explicit_state"
     # *_stack: все слои layers сразу; бюджет ранга R = stack_rank × число слоёв и сила A — по слоям
     # на симплексе: uniform (поровну) или importance (по приросту одного слоя на val, SimplexLoRA).
@@ -262,8 +265,11 @@ class ExperimentConfig:
             raise ValueError("scored mode is deterministic: decision.n_trials must be 1")
         if self.decision.n_trials > 1 and self.decision.temperature <= 0:
             raise ValueError("n_trials > 1 needs temperature > 0, otherwise trials are identical")
-        if self.data.generator not in ("v2", "v3"):
-            raise ValueError("data.generator must be 'v2' or 'v3'")
+        if self.data.generator not in ("v2", "v3", "g1"):
+            raise ValueError("data.generator must be 'v2', 'v3' or 'g1'")
+        if self.data.generator == "g1" and self.episode.enabled:
+            raise ValueError("g1 (глобальный срез): многошаговые эпизоды не определены — ask_user "
+                             "завершает эпизод. Поставьте episode.enabled=False (docs/METRICS.md).")
         if self.tact.window not in WINDOW_KINDS:
             raise ValueError(f"unknown tact.window {self.tact.window!r}")
         if self.episode.max_steps < 1:

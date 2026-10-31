@@ -154,6 +154,11 @@ class ActCfg:
     stack_allocs: list[str] = field(default_factory=lambda: ["uniform", "importance"])
     stack_alphas: list[float] = field(default_factory=lambda: [1.0, 1.5, 2.0, 3.0])
     stack_rank: int = 8
+    # Отбор (JOURNAL, решение 2026-10-31): "val" — успех на val; "val+loto" — среднее успеха на val и
+    # на отложенном типе требований внутри train (карта подгоняется без задач этого типа, оценка — на
+    # них; по типам из loto_kinds, результат объединяется). Ограничение на специфичность — на val.
+    select: str = "val"
+    loto_kinds: list[str] = field(default_factory=lambda: ["deadline", "quantity", "budget"])
 
 
 @dataclass

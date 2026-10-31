@@ -416,6 +416,17 @@ def test_contrast_targets():
         IV.contrast_targets(H, [False] * 4, gold)
 
 
+def test_requirement_kind():
+    from collections import Counter
+
+    kinds = Counter(S.requirement_kind(t) for t in S.build_pilot_set(160, seed=0, version="v3"))
+    assert set(kinds) <= {"deadline", "quantity", "budget", "none", "access", "stress"}
+    assert all(kinds[k] > 0 for k in ("deadline", "quantity", "budget", "access"))
+    tr = S.build_transfer_set(40, seed=7)
+    assert {S.requirement_kind(t) for t in tr["unseen"]} <= {"rating", "warranty"}
+    assert {S.requirement_kind(t) for t in tr["seen"]} <= {"deadline", "quantity", "budget"}
+
+
 def test_teacher_targets_and_simplex_allocation():
     from steering_tool_feedback import interventions as IV
 

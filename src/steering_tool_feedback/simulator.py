@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -839,6 +840,17 @@ def _build_v3(n_tasks: int, seed: int) -> list[PairedTask]:
         seen.add(sig)
         tasks.append(t)
     return tasks
+
+
+def requirement_kind(task: PairedTask) -> str:
+    """Тип требования задачи: deadline / quantity / budget / none (магазин, v3 и перенос — из notes),
+    access (документы), stress. Для отбора с отложенным типом требований (act.select="val+loto")."""
+    m = re.search(r"need=(\w+)", task.notes)
+    if m:
+        return m.group(1)
+    if task.pair_type == "stress":
+        return "stress"
+    return "access" if task.domain == "documents" else "none"
 
 
 GENERATOR_VERSION = "v3"

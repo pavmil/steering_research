@@ -75,13 +75,14 @@ def _progress(it, desc: str, total: int | None = None, disable: bool = False):
         return it
 
 
-def _select(rows: list[dict], tol: float, prefer: str = "alpha") -> dict | None:
+def _select(rows: list[dict], tol: float, prefer: str = "alpha", key: str = "success") -> dict | None:
     """Правило выбора на val, одно для всех методов: максимум успеха при падении
-    специфичности не больше допуска; при равенстве — меньшая сила вмешательства."""
-    ok = [r for r in rows if r["spec_drop"] <= tol + 1e-12]
+    специфичности не больше допуска; при равенстве — меньшая сила вмешательства.
+    key="score" — отбор val+loto: среднее успеха на val и на отложенном типе требований."""
+    ok = [r for r in rows if r["spec_drop"] <= tol + 1e-12 and r.get(key) is not None]
     if not ok:
         return None
-    return max(ok, key=lambda r: (r["success"], -float(r.get(prefer, 0.0))))
+    return max(ok, key=lambda r: (r[key], -float(r.get(prefer, 0.0))))
 
 
 class Experiment:
@@ -105,6 +106,7 @@ class Experiment:
         self.affines_by_id: dict[str, Any] = {}
         self.cast_conds: dict[str, np.ndarray] = {}
         self._targets: dict[str, dict[str, Any]] = {}   # цели linmap по виду учителя
+        self._loto_maps: dict[tuple, str] = {}          # (вид цели, отложенный тип, слой, ранг) → id
         self._prompts: dict[tuple, Prompt] = {}
         self._dcache: DecisionCache | None = None
         self._acache: ActivationCache | None = None
@@ -893,20 +895,30 @@ class Experiment:
         return tasks, [(t.task_id, b) for t in tasks for b in (0, 1)]
 
     def _fit_affine_grid(self, name: str, maps: dict[int, Any], alphas: list[float],
-                         extra: dict[int, dict] | None = None) -> dict[str, Any]:
-        """Оценка аффинных карт (слой → AffineMap) на val по сетке alpha, выбор общим правилом."""
+                         extra: dict[int, dict] | None = None, kind: str | None = None) -> dict[str, Any]:
+        """Оценка аффинных карт (слой → AffineMap) на val по сетке alpha, выбор общим правилом.
+        act.select="val+loto" и цель без учителя-LoRA (kind) — ещё и на отложенном типе требований."""
         base = self.state["records"]["val"]["baseline"]
         bs = self.state["summaries"]["val"]["baseline"]
-        res: dict[str, Any] = {"rows": [], "row": None}
+        loto = self.cfg.act.select == "val+loto" and kind in ("contrast", "prompt", "mix")
+        res: dict[str, Any] = {"rows": [], "row": None, "select": "val+loto" if loto else "val"}
         for (L, r), am in maps.items():
             aid = self._register_affine(am)
             for a in alphas:
                 spec = AffineSpec(aid, L, float(a))
                 recs = self.evaluate(name, "val", write=False, affine=spec, tag=f"{name} L{L}/r{r}/a{a}")
-                res["rows"].append(self._row(self.summarize(recs, base), bs, layer=L, rank=r, alpha=float(a),
-                                             affine_id=aid, **(extra or {}).get((L, r), {}),
-                                             train_r2=am.info.get("train_r2")))
-        res["row"] = _select(res["rows"], self.cfg.steer.max_specificity_drop)
+                row = self._row(self.summarize(recs, base), bs, layer=L, rank=r, alpha=float(a),
+                                affine_id=aid, **(extra or {}).get((L, r), {}),
+                                train_r2=am.info.get("train_r2"))
+                if loto:
+                    ls = self._loto_summary(name, kind, L, r, float(a))
+                    row.update(loto_success=ls["success"], loto_sensitivity=ls["sensitivity"],
+                               loto_specificity=ls["specificity"], loto_fixed=ls["fixed"],
+                               loto_broken=ls["broken"], score=(row["success"] + ls["success"]) / 2)
+                res["rows"].append(row)
+        tol = self.cfg.steer.max_specificity_drop
+        res["row_val"] = _select(res["rows"], tol)
+        res["row"] = _select(res["rows"], tol, key="score") if loto else res["row_val"]
         if res["row"] is None:
             res["reason"] = "все конфигурации роняют специфичность сверх допуска"
         self._save_affines(name, {r["affine_id"] for r in res["rows"]})
@@ -1032,6 +1044,82 @@ class Experiment:
         self._targets[kind] = out
         return out
 
+    def _fold_targets(self, kind: str, exclude: str) -> dict[str, Any]:
+        """Цели без задач типа exclude (отбор с отложенным типом): та же подгонка на остальных
+        типах train. Учитель-LoRA обучен и на отложенном типе — для linmap_lora неприменимо."""
+        from . import interventions as IV
+
+        key = f"{kind}|-{exclude}"
+        if key in self._targets:
+            return self._targets[key]
+        if kind not in ("contrast", "prompt", "mix"):
+            return {"reason": f"цель {kind!r}: учитель видел отложенный тип требований"}
+        full = self._linmap_targets(kind)
+        if "reason" in full:
+            return full
+        tasks, keys = self._train_changing()
+        by = {t.task_id: t for t in tasks}
+        keep = np.array([S.requirement_kind(by[t]) != exclude for t, _ in keys])
+        layers = full["layers"]
+        H = {L: full["H"][L][keep] for L in layers}
+        if kind == "contrast":
+            ok = np.asarray(full["base_ok"], dtype=bool)[keep]
+            gold = np.array([sorted(by[t].branch(b).allowed_actions)[0] for t, b in keys])[keep]
+            if ok.all() or not ok.any():
+                return {"reason": "в фолде нет и верных, и неверных решений базы"}
+            D = {L: IV.contrast_targets(H[L], ok, gold) for L in layers}
+        elif kind == "prompt":
+            D = {L: full["D"][L][keep] for L in layers}
+        else:
+            tp, tc = self._linmap_targets("prompt"), self._fold_targets("contrast", exclude)
+            if "reason" in tc:
+                return tc
+            t_ok = np.asarray(tp["teacher_ok"], dtype=bool)[keep]
+            D = {L: IV.mix_targets(tp["D"][L][keep], tc["D"][L], t_ok) for L in layers}
+        out = {"layers": layers, "H": H, "D": D, "n_examples": int(keep.sum()), "exclude": exclude}
+        self._targets[key] = out
+        return out
+
+    def _loto_split(self, kind: str) -> tuple[str, list[dict]]:
+        """Псевдосплит loto:<тип> — задачи train этого типа требований (меняющие и инвариантные)
+        и решения базы на них (из кэша train)."""
+        split = f"loto:{kind}"
+        if split not in self.state["splits"]:
+            self.state["splits"][split] = [t for t in self.state["splits"]["train"]
+                                           if S.requirement_kind(t) == kind
+                                           and t.pair_type in ("changing", "invariant")]
+        recs = self.state.setdefault("records", {}).setdefault(split, {})
+        if "baseline" not in recs:
+            recs["baseline"] = (self.evaluate("baseline", split, write=False)
+                                if self.state["splits"][split] else [])
+        return split, recs["baseline"]
+
+    def _loto_summary(self, name: str, kind: str, L: int, r: int, alpha: float) -> dict[str, Any]:
+        """Успех на отложенных типах: для каждого типа из act.loto_kinds карта подгоняется без его
+        задач и оценивается на них; решения всех типов сводятся в одну сводку."""
+        from . import interventions as IV
+
+        c = self.cfg.act
+        recs: list[dict] = []
+        base: list[dict] = []
+        for k in c.loto_kinds:
+            split, b = self._loto_split(k)
+            if not b:
+                continue
+            t = self._fold_targets(kind, k)
+            if "reason" in t:
+                raise ValueError(f"LOTO {name}/{k}: {t['reason']}")
+            mk = (kind, k, L, r)
+            if mk not in self._loto_maps:
+                self._loto_maps[mk] = self._register_affine(
+                    IV.fit_affine(t["H"][L], t["D"][L], r, c.n_pcs, c.ridge, self.cfg.data.seed))
+            recs += self.evaluate(name, split, write=False, affine=AffineSpec(self._loto_maps[mk], L, alpha),
+                                  tag=f"{name} loto:{k} L{L}/r{r}/a{alpha}")
+            base += b
+        if not recs:
+            raise ValueError("LOTO: в train нет задач ни одного типа из act.loto_kinds")
+        return self.summarize(recs, base)
+
     def _fit_linmap_family(self, name: str, kind: str) -> dict[str, Any]:
         """Один слой: карта в закрытой форме для каждого (слой, ранг), сила — по сетке на val."""
         from . import interventions as IV
@@ -1046,7 +1134,7 @@ class Experiment:
                 maps[(L, r)] = IV.fit_affine(t["H"][L], t["D"][L], r, c.n_pcs, c.ridge, self.cfg.data.seed)
         cost = {"acts_seconds": t["acts_seconds"], "fit_seconds": round(time.perf_counter() - t0, 1),
                 "n_examples": t["n_examples"]}
-        res = self._fit_affine_grid(name, maps, c.alphas)
+        res = self._fit_affine_grid(name, maps, c.alphas, kind=kind)
         res["cost"] = cost
         res.update({k: t[k] for k in ("teacher", "teacher_train_success", "base_train_success") if k in t})
         return res
@@ -1200,14 +1288,16 @@ class Experiment:
         return res
 
     def _specs_for(self, method: str) -> dict[str, Any] | None:
-        """Параметры выбранного (на val) метода для evaluate; None — метод не выбран."""
+        """Параметры выбранного (на val) метода для evaluate; None — метод не выбран.
+        «m@val» — выбор того же метода только по val (когда отбор val+loto выбрал другое)."""
         if method == "steering":
             st = self._steer_spec()
             return None if st is None else {"steer": st}
+        method, _, variant = method.partition("@")
         f = (self.state.get("fitted") or {}).get(method)
-        if f is None or f.get("row") is None:
+        r = (f or {}).get("row_val" if variant == "val" else "row")
+        if r is None:
             return None
-        r = f["row"]
         if method == "steering_gated":
             return {"gate": self._gate_spec(r)}
         if method == "tact":
@@ -1238,6 +1328,12 @@ class Experiment:
                 self.log(f"fit {m}: " + (f"выбрано, успех {r['base_success']:.3f} → {r['success']:.3f}, "
                                          f"Δспециф. {-r['spec_drop']:+.3f}" if r else
                                          f"ничего не выбрано — {fitted[m].get('reason')}"))
+                rv = fitted[m].get("row_val")
+                if r and fitted[m].get("select") == "val+loto":
+                    self.log(f"  {m} отбор val+loto: L{r['layer']}/r{r['rank']}/α{r['alpha']}, отложенный тип "
+                             f"{r['loto_success']:.3f}; по одному val: " +
+                             (f"L{rv['layer']}/r{rv['rank']}/α{rv['alpha']}, отложенный тип {rv['loto_success']:.3f}"
+                              if rv else "ничего"))
         self.state["fitted"] = fitted
         self._save_json("fitted.json", {m: {k: v for k, v in f.items() if k != "rows"}
                                         for m, f in fitted.items()})
@@ -1250,18 +1346,38 @@ class Experiment:
         self._mark("fit")
         return fitted
 
+    def _method_names(self) -> list[str]:
+        """Методы для сравнения и варианты «m@val» — выбор только по val, если отбор val+loto
+        выбрал другую конфигурацию (чтобы на переносе было видно, что дал новый отбор)."""
+        names = list(self.cfg.eval.methods)
+        for m, f in (self.state.get("fitted") or {}).items():
+            a, b = f.get("row"), f.get("row_val")
+            if f.get("select") == "val+loto" and a and b and \
+                    (a["affine_id"], a["alpha"]) != (b["affine_id"], b["alpha"]):
+                names.append(f"{m}@val")
+        return names
+
+    def _eval_named(self, name: str, split: str) -> list[dict] | None:
+        """evaluate для метода или варианта «m@val»; None — метод не выбран."""
+        m = name.partition("@")[0]
+        spec = get_method(m)
+        specs = self._specs_for(name) if (spec.steer or spec.fitted) else {}
+        if specs is None:
+            return None
+        return self.evaluate(m, split, tag=name if name != m else None, **specs)
+
     def _val_compare(self) -> None:
         """Все методы на val — картина ДО test. Для выбранных методов val оптимистичен:
         на нём же шёл подбор."""
         base = self.state["records"]["val"]["baseline"]
         recs_by: dict[str, list[dict]] = {"baseline": base}
-        for m in self.cfg.eval.methods:
+        for m in self._method_names():
             if m == "baseline":
                 continue
-            specs = {} if not (get_method(m).steer or get_method(m).fitted) else self._specs_for(m)
-            if specs is None:
+            recs = self._eval_named(m, "val")
+            if recs is None:
                 continue
-            recs_by[m] = self.evaluate(m, "val", **specs)
+            recs_by[m] = recs
             self.state["summaries"]["val"][m] = self.summarize(recs_by[m], base)
         self.state.setdefault("records", {})["val"].update(recs_by)
         self.state["val_comparisons"] = self._comparisons(recs_by)
@@ -1269,8 +1385,11 @@ class Experiment:
             eps = {"baseline": self.evaluate_episodes("baseline", "val")}
             for m in recs_by:
                 if m != "baseline":
-                    specs = {} if not (get_method(m).steer or get_method(m).fitted) else self._specs_for(m)
-                    eps[m] = self.evaluate_episodes(m, "val", **(specs or {}))
+                    base_m = m.partition("@")[0]
+                    spec = get_method(base_m)
+                    specs = {} if not (spec.steer or spec.fitted) else self._specs_for(m)
+                    eps[m] = self.evaluate_episodes(base_m, "val", tag=m if m != base_m else None,
+                                                    **(specs or {}))
             for m, e in eps.items():
                 self.state["episodes"]["val"][m] = self.summarize_episodes(
                     e, None if m == "baseline" else eps["baseline"])
@@ -1303,14 +1422,13 @@ class Experiment:
             base = self.evaluate("baseline", split)
             recs_by: dict[str, list[dict]] = {"baseline": base}
             self.state["summaries"][split]["baseline"] = self.summarize(base)
-            for m in self.cfg.eval.methods:
+            for m in self._method_names():
                 if m == "baseline":
                     continue
-                spec = get_method(m)
-                specs = self._specs_for(m) if (spec.steer or spec.fitted) else {}
-                if specs is None:
+                recs = self._eval_named(m, split)
+                if recs is None:
                     continue
-                recs_by[m] = self.evaluate(m, split, **specs)
+                recs_by[m] = recs
                 self.state["summaries"][split][m] = self.summarize(recs_by[m], base)
             out = {"methods": dict(self.state["summaries"][split]),
                    "comparisons": self._comparisons(recs_by), "episodes": {}}
@@ -1319,9 +1437,11 @@ class Experiment:
                 for m in c.episode_methods:
                     if m not in recs_by:
                         continue
-                    spec = get_method(m)
+                    base_m = m.partition("@")[0]
+                    spec = get_method(base_m)
                     specs = self._specs_for(m) if (spec.steer or spec.fitted) else {}
-                    eps[m] = self.evaluate_episodes(m, split, **(specs or {}))
+                    eps[m] = self.evaluate_episodes(base_m, split, tag=m if m != base_m else None,
+                                                    **(specs or {}))
                 for m, e in eps.items():
                     out["episodes"][m] = self.summarize_episodes(
                         e, None if m == "baseline" else eps.get("baseline"))

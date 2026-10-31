@@ -656,6 +656,47 @@ def test_mix_target_combines_teacher_and_contrast(root):
     assert f["cost"]["acts_seconds"] == tp["acts_seconds"]
 
 
+LOTO_METHODS = ["baseline", "lora", "linmap", "linmap_prompt", "linmap_mix"]
+
+
+def test_loto_selection_on_mock(root):
+    ov = {"eval.methods": LOTO_METHODS, "act.select": "val+loto", "act.ranks": [8],
+          "act.alphas": [0.5, 1.0, 2.0], "transfer.n_tasks": 40,
+          "transfer.episode_methods": ["baseline", "linmap_mix"]}
+    exp = _exp(root, **ov)
+    exp.run("fit")
+    fitted = exp.state["fitted"]
+    tol = exp.cfg.steer.max_specificity_drop
+    for m in ("linmap", "linmap_prompt", "linmap_mix"):
+        f = fitted[m]
+        assert f["select"] == "val+loto"
+        for r in f["rows"]:
+            assert r["loto_success"] is not None and abs(r["score"] - (r["success"] + r["loto_success"]) / 2) < 1e-12
+        ok = [r for r in f["rows"] if r["spec_drop"] <= tol + 1e-12]
+        assert f["row"]["score"] == max(r["score"] for r in ok)
+        assert f["row_val"]["success"] == max(r["success"] for r in ok)
+    assert fitted["lora"].get("select", "val") == "val"
+    # фолд не содержит задач отложенного типа и подгоняется на меньшем числе примеров
+    tasks, keys = exp._train_changing()
+    by = {t.task_id: t for t in tasks}
+    for k in exp.cfg.act.loto_kinds:
+        t = exp._targets.get(f"contrast|-{k}")
+        n_k = sum(S.requirement_kind(by[tid]) == k for tid, _ in keys)
+        if n_k:
+            assert t["n_examples"] == len(keys) - n_k
+        assert all(S.requirement_kind(x) == k for x in exp.state["splits"][f"loto:{k}"])
+    exp.transfer()
+    names = exp._method_names()
+    for m in ("linmap", "linmap_prompt", "linmap_mix"):
+        if f"{m}@val" in names:
+            assert f"{m}@val" in exp.state["summaries"]["transfer:unseen"]
+    # повтор — всё из кэша, включая карты фолдов и оценку на отложенных типах
+    be = MockBackend()
+    exp2 = _exp(root, backend=be, **ov)
+    exp2.run("fit")
+    assert be.calls == {"decide": 0, "record": 0, "train": 0}
+
+
 def test_stack_needs_parent(root):
     exp = _exp(root, **{"eval.methods": ["baseline", "linmap_stack"]})
     exp.run("fit")

@@ -998,12 +998,13 @@ class Experiment:
                 return {"reason": "нужны и верные, и неверные решения базы на train"}
             gold = [sorted(by[t].branch(b).allowed_actions)[0] for t, b in keys]
             out["D"] = {L: IV.contrast_targets(H[L], correct, gold) for L in layers}
+            out["base_ok"] = correct
         elif kind == "prompt":
             ht, actions = self._teacher_call_point(prompts, layers)
             t_ok = [S.score_action(a, by[t].branch(b)) for a, (t, b) in zip(actions, keys)]
             b_ok = self._train_ok(("changing",))
             out["D"] = {L: IV.teacher_targets(H[L], np.stack([x[L] for x in ht]), t_ok) for L in layers}
-            out.update(teacher=self.cfg.act.teacher, teacher_train_success=float(np.mean(t_ok)),
+            out.update(teacher=self.cfg.act.teacher, teacher_ok=t_ok, teacher_train_success=float(np.mean(t_ok)),
                        base_train_success=float(np.mean([b_ok[k] for k in keys])))
             ask, go, n_ask = TWO_STEP[self.cfg.act.teacher]
 
@@ -1015,6 +1016,16 @@ class Experiment:
             per += self._seconds_per_prompt(f"teacher:{self.cfg.act.teacher}:{lk}", teach, prompts)
             self.log(f"учитель {self.cfg.act.teacher} на train: успех {out['teacher_train_success']:.3f} "
                      f"(база {out['base_train_success']:.3f})")
+        elif kind == "mix":
+            tp, tc = self._linmap_targets("prompt"), self._linmap_targets("contrast")
+            for t in (tp, tc):
+                if "reason" in t:
+                    return t
+            out["D"] = {L: IV.mix_targets(tp["D"][L], tc["D"][L], tp["teacher_ok"]) for L in layers}
+            out.update({k: tp[k] for k in ("teacher", "teacher_train_success", "base_train_success")})
+            out["acts_seconds"] = tp["acts_seconds"]       # те же активации и тот же учитель
+            self._targets[kind] = out
+            return out
         else:
             raise KeyError(kind)
         out["acts_seconds"] = round(per * len(prompts), 1)
@@ -1051,6 +1062,10 @@ class Experiment:
     def _fit_linmap_prompt(self) -> dict[str, Any]:
         """Учитель — та же модель с двухшаговым промптом (cfg.act.teacher), без градиента."""
         return self._fit_linmap_family("linmap_prompt", "prompt")
+
+    def _fit_linmap_mix(self) -> dict[str, Any]:
+        """Цель учителя-промпта, где он прав; иначе центроид верных состояний базы."""
+        return self._fit_linmap_family("linmap_mix", "mix")
 
     def _fit_stack(self, name: str, parent: str, kind: str) -> dict[str, Any]:
         """Все слои сразу; бюджет ранга R = stack_rank × слоёв и сила A — по слоям на симплексе:
@@ -1199,7 +1214,7 @@ class Experiment:
             return {"tact": self._tact_spec(r)}
         if method == "lora":
             return {"adapter": AdapterSpec(r["adapter_id"], r["path"])}
-        if method in ("linmap_lora", "linmap", "linmap_prompt", "reft"):
+        if method in ("linmap_lora", "linmap", "linmap_prompt", "linmap_mix", "reft"):
             return {"affine": AffineSpec(r["affine_id"], r["layer"], r["alpha"])}
         if method in ("linmap_stack", "linmap_prompt_stack"):
             return {"affine": AffineStackSpec(tuple(AffineSpec(i, L, a) for i, L, a in
@@ -1508,6 +1523,7 @@ class Experiment:
             keep = {"linmap_lora": ("affine_id", "layer", "rank", "alpha"),
                     "linmap": ("affine_id", "layer", "rank", "alpha"),
                     "linmap_prompt": ("affine_id", "layer", "rank", "alpha"),
+                    "linmap_mix": ("affine_id", "layer", "rank", "alpha"),
                     "linmap_stack": ("affine_ids", "layers", "ranks", "alphas", "alloc", "alpha"),
                     "linmap_prompt_stack": ("affine_ids", "layers", "ranks", "alphas", "alloc", "alpha"),
                     "reft": ("affine_id", "layer", "rank", "alpha"),
@@ -1536,7 +1552,7 @@ class Experiment:
         if "steering_gated" in methods:
             g = self.gates_by_id[methods["steering_gated"]["gate_id"]]
             np.savez(fdir / f"{fid}_gate.npz", **{k: np.asarray(x) for k, x in g.items()})
-        for m in ("linmap_lora", "linmap", "linmap_prompt", "reft"):
+        for m in ("linmap_lora", "linmap", "linmap_prompt", "linmap_mix", "reft"):
             if m in methods:
                 am = self.affines_by_id[methods[m]["affine_id"]]
                 np.savez(fdir / f"{fid}_{m}.npz", U=am.U, P=am.P, a0=am.a0)

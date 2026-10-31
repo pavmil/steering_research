@@ -643,6 +643,19 @@ def test_prompt_teacher_and_stack_on_mock(root):
     assert be.calls == {"decide": 0, "record": 0, "train": 0}
 
 
+def test_mix_target_combines_teacher_and_contrast(root):
+    exp = _exp(root, **{"eval.methods": ["baseline", "linmap_mix"]})
+    exp.run("fit")
+    f = exp.state["fitted"]["linmap_mix"]
+    assert f["rows"] and f["teacher"] == "explicit_state"
+    tm, tp, tc = (exp._targets[k] for k in ("mix", "prompt", "contrast"))
+    ok = np.asarray(tp["teacher_ok"])
+    assert ok.any() and (~ok).any()
+    L = tm["layers"][0]
+    assert np.allclose(tm["D"][L][ok], tp["D"][L][ok]) and np.allclose(tm["D"][L][~ok], tc["D"][L][~ok])
+    assert f["cost"]["acts_seconds"] == tp["acts_seconds"]
+
+
 def test_stack_needs_parent(root):
     exp = _exp(root, **{"eval.methods": ["baseline", "linmap_stack"]})
     exp.run("fit")

@@ -431,6 +431,8 @@ def test_teacher_targets_and_simplex_allocation():
     assert [i for i, _, _ in parts] == [0, 2]                  # слои без ранга выпадают
     assert parts[1][1] == 8                                    # потолок ранга
     assert np.isclose(sum(a for _, _, a in parts), 2.0)
+    M = IV.mix_targets(np.ones((3, 2)), np.full((3, 2), 5.0), [True, False, True])
+    assert np.allclose(M[[0, 2]], 1.0) and np.allclose(M[1], 5.0)
     u = IV.allocate(IV.simplex_weights([1, 1, 1, 1]), 32, 1.0, 32)
     assert [r for _, r, _ in u] == [8] * 4 and np.allclose([a for _, _, a in u], 0.25)
 

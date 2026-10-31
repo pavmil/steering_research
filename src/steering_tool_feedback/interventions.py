@@ -11,6 +11,7 @@ linmap      — без учителя: цель для неверного реш
               правильным действием; для верного — ноль. Та же подгонка в закрытой форме.
 linmap_prompt — учитель-промпт: Δh = h(та же модель с промптом explicit_state) − h(база) там, где
               учитель решил верно. Дистилляция контекста в активации без градиента.
+linmap_mix  — цель учителя-промпта, где он прав; иначе цель linmap.
 *_stack     — те же цели на нескольких слоях сразу; ранг и сила распределены по слоям на симплексе
               (равномерно или по важности слоя — идея SimplexLoRA, 2610.37206).
 reft        — LoReFT (Wu et al., 2404.03592): h + Rᵀ(W h + b − R h), R с ортонормированными строками,
@@ -102,6 +103,14 @@ def teacher_targets(H: np.ndarray, H_teacher: np.ndarray, teacher_ok: Sequence[b
     D = np.asarray(H_teacher, dtype=np.float64) - H
     D[~np.asarray(teacher_ok, dtype=bool)] = 0.0
     return D
+
+
+def mix_targets(D_teacher: np.ndarray, D_contrast: np.ndarray, teacher_ok: Sequence[bool]) -> np.ndarray:
+    """Объединённая цель (linmap_mix): цель учителя-промпта там, где он решил верно; иначе — цель
+    без учителя (центроид верных состояний базы; ноль, где база и так права). Учитель-промпт лучше
+    переносится на новые типы требований, центроид — точнее на знакомых (JOURNAL, прогон 09)."""
+    ok = np.asarray(teacher_ok, dtype=bool)[:, None]
+    return np.where(ok, np.asarray(D_teacher, dtype=np.float64), np.asarray(D_contrast, dtype=np.float64))
 
 
 # --------------------------------------------------------------------------

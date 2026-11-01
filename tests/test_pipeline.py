@@ -821,6 +821,12 @@ def test_crossslice_h4_prime_on_mock(root):
     assert out["verdict"].preliminary and out["verdict"].status in ("support", "against", "inconclusive")
     with pytest.raises(FileNotFoundError):
         X.compare(cond.dir, glob.dir, "transfer:seen", methods=("reft",))
+    # ориентир не выбран в одном срезе (ни одна конфигурация не прошла допуск): вердикта нет, только описание
+    (glob.dir / "decisions" / "transfer-seen__lora.jsonl").unlink()
+    out = X.compare(cond.dir, glob.dir, "transfer:seen", n_boot=500)
+    assert out["verdict"].status == "not_run" and out["ref_missing"] == ["glob"] and "глобальном" in out["verdict"].reason
+    assert [r["method"] for r in out["rows"]] == ["linmap", "linmap_prompt"]
+    assert all("I" not in r and 0 <= r["success_glob"] <= 1 for r in out["rows"])
 
 
 def test_gate_h4_prime():

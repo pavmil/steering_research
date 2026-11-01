@@ -54,6 +54,9 @@ def compare(cond_run: str | Path, glob_run: str | Path, split: str = "transfer:s
     level = alpha / max(1, len(pairs))                         # Холм: первый шаг — alpha / k
     runs = {"cond": Path(cond_run), "glob": Path(glob_run)}
     base = {s: load_decisions(d, split, "baseline") for s, d in runs.items()}
+    missing = [s for s, d in runs.items() if not _has(d, split, ref)]
+    if missing:
+        return _without_ref(runs, split, pairs, ref, base, missing, tol, level, preliminary=split != "test")
     refr = {s: load_decisions(d, split, ref) for s, d in runs.items()}
     rows = []
     for label, names in pairs.items():
@@ -73,3 +76,33 @@ def compare(cond_run: str | Path, glob_run: str | Path, split: str = "transfer:s
         rows.append(row)
     return {"split": split, "level": 1 - level, "ref": ref, "rows": rows,
             "verdict": G.h4_prime(rows, preliminary=split != "test", margin=margin)}
+
+
+def _has(run_dir: Path, split: str, method: str) -> bool:
+    return (run_dir / "decisions" / f"{split.replace(':', '-')}__{method.replace(':', '-')}.jsonl").exists()
+
+
+def _without_ref(runs: dict[str, Path], split: str, pairs: dict[str, tuple[str, str]], ref: str,
+                 base: dict[str, list[dict]], missing: list[str], tol: float, level: float,
+                 preliminary: bool) -> dict[str, Any]:
+    """Ориентира нет хотя бы в одном срезе (ни одна его конфигурация не прошла допуск отбора, и он не
+    оценивался). Предрегистрация H4′ этот случай не описывает: Δ не определена, вердикта нет. Строки —
+    только описание методов по срезам (успех, принятие / чувствительность, сохранность / специфичность)."""
+    rows = []
+    for label, names in pairs.items():
+        row: dict[str, Any] = {"method": label, "cond_name": names[0], "glob_name": names[1]}
+        for s, n in zip(("cond", "glob"), names):
+            rec = load_decisions(runs[s], split, n) if _has(runs[s], split, n) else []
+            main = [bool(r["ok"]) for r in rec if r["pair_type"] in M.MAIN_TYPES]
+            eb, em = target_effect(base[s]), target_effect(rec)
+            row.update({f"success_{s}": sum(main) / len(main) if main else float("nan"),
+                        f"sens_{s}": em.sensitivity, f"spec_{s}": em.specificity,
+                        f"spec_drop_{s}": eb.specificity - em.specificity,
+                        f"eligible_{s}": bool(main) and eb.specificity - em.specificity <= tol + 1e-12})
+        rows.append(row)
+    names = {"cond": "условном", "glob": "глобальном"}
+    why = (f"ориентир {ref!r} не оценивался на {split!r} в {' и '.join(names[s] for s in missing)} срезе: "
+           f"ни одна его конфигурация не прошла допуск отбора; Δ и I не определены, предрегистрация H4′ "
+           f"этот случай не описывает")
+    return {"split": split, "level": 1 - level, "ref": ref, "ref_missing": missing, "rows": rows,
+            "verdict": G.Verdict("not_run", why, preliminary)}
